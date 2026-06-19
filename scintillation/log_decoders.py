@@ -700,9 +700,9 @@ def decode_file(filepath: str) -> tuple:
     satvis2_df   = pd.DataFrame(satvis2_obs)   if satvis2_obs   else pd.DataFrame()
 
     # Enrich RANGE: add diff columns + per-signal flags
-    from scintillation_detector import (enrich_range_df, enrich_range_with_elevation,
-                                        epoch_health, enrich_bestpos_df,
-                                        detect_scintillation)
+    from scintillation.scintillation_detector import (enrich_range_df, enrich_range_with_elevation,
+                                                      epoch_health, enrich_bestpos_df,
+                                                      detect_scintillation)
     range_df        = enrich_range_df(range_df)
     range_df        = enrich_range_with_elevation(range_df, satvis2_df)
     epoch_health_df = epoch_health(range_df)
@@ -1055,7 +1055,7 @@ if __name__ == "__main__":
         print(f"Saved → {OUT_SATVIS2}")
 
     # ── Scintillation summary JSON ─────────────────────────────────────
-    from scintillation_detector import summarise_results
+    from scintillation.scintillation_detector import summarise_results
     import json
 
     summary = summarise_results(scintillation_df, epoch_health_df, bestpos_df, range_df)
