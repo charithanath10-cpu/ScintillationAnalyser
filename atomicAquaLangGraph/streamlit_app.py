@@ -494,6 +494,13 @@ for role, msg in st.session_state.chat:
         with st.chat_message("user"):
             st.markdown(msg)
 
+# ── Upload status banner — shown immediately when a large upload is in progress ──
+# This renders on every rerun, so if session_state marks an upload as in-progress
+# the user sees feedback even during the browser→server transfer phase.
+if st.session_state.get("upload_in_progress"):
+    uip = st.session_state.upload_in_progress
+    st.info(f"📡 Receiving **{uip['name']}** ({uip['size_str']}) — please wait, large files take a moment to transfer...")
+
 # ── Paperclip file uploader ───────────────────────────────────────────
 uploaded_file = st.file_uploader(
     "Upload file", type=["txt", "log", "ascii", "abbrev_ascii", "dat", "bin", "json", "csv", "gpf", "gps"],
@@ -516,8 +523,9 @@ if uploaded_file and uploaded_file.file_id not in st.session_state.get("processe
         print(f"[UPLOAD][2] REJECTED: file too large ({file_size} bytes, max {MAX_UPLOAD})")
         st.error(f"File is {file_size / (1024*1024):.1f} MB. Max allowed is {MAX_UPLOAD / (1024*1024):.0f} MB.")
     else:
-        print(f"[UPLOAD][2] Accepted: {file_name} ({file_size/1024/1024:.1f} MB), path=large" if file_size > SIZE_THRESHOLD else f"[UPLOAD][2] Accepted: {file_name} ({file_size/1024:.1f} KB), path=small")
         size_str = f"{file_size / 1024:.1f} KB" if file_size < 1024 * 1024 else f"{file_size / (1024*1024):.1f} MB"
+        print(f"[UPLOAD][2] Accepted: {file_name} ({size_str}), path={'large' if file_size > SIZE_THRESHOLD else 'small'}")
+
         file_chip_html = f"""
         <div style="display:inline-flex;align-items:center;gap:7px;
           background:#e8f2fa;border:1px solid #b8d0e8;border-radius:8px;
@@ -531,17 +539,32 @@ if uploaded_file and uploaded_file.file_id not in st.session_state.get("processe
 
         if file_size > SIZE_THRESHOLD:
             print(f"[UPLOAD][4] Large file path: reading bytes from widget...")
-            with st.spinner(f"⬆️ Uploading {file_name} ({size_str}) to cloud..."):
+            import time as _time
+
+            # Show live status box for the S3 upload — keeps WebSocket alive
+            # and gives the user clear per-step feedback
+            with st.status(f"⬆️ Uploading {file_name} ({size_str})", expanded=True) as up_status:
+                st.write(f"📥 Receiving file from browser... ({size_str})")
                 try:
-                    import time as _time
                     t0 = _time.time()
                     file_bytes = uploaded_file.read()
-                    print(f"[UPLOAD][5] Widget read complete: {len(file_bytes)} bytes in {_time.time()-t0:.2f}s")
-                    print(f"[UPLOAD][6] Starting S3 upload to bucket={S3_BUCKET}...")
+                    read_time = _time.time() - t0
+                    print(f"[UPLOAD][5] Widget read complete: {len(file_bytes)} bytes in {read_time:.2f}s")
+
+                    st.write(f"✅ File received in {read_time:.1f}s")
+                    st.write(f"☁️ Uploading to cloud storage ({size_str})...")
+
                     t1 = _time.time()
+                    print(f"[UPLOAD][6] Starting S3 upload to bucket={S3_BUCKET}...")
                     s3_key = upload_to_s3_with_progress(file_bytes, file_name)
-                    print(f"[UPLOAD][7] S3 upload complete: key={s3_key} in {_time.time()-t1:.2f}s")
+                    s3_time = _time.time() - t1
+                    print(f"[UPLOAD][7] S3 upload complete: key={s3_key} in {s3_time:.2f}s")
                     del file_bytes  # free RAM immediately
+
+                    st.write(f"✅ Uploaded to cloud in {s3_time:.1f}s")
+                    st.write(f"🔍 Starting log analysis...")
+                    up_status.update(label=f"✅ {file_name} uploaded — starting analysis", state="complete", expanded=False)
+
                     st.session_state.pending_upload = {
                         "s3_key": s3_key,
                         "file_name": file_name,
@@ -550,15 +573,18 @@ if uploaded_file and uploaded_file.file_id not in st.session_state.get("processe
                     print(f"[UPLOAD][8] pending_upload set with s3_key, calling st.rerun()")
                 except Exception as e:
                     import traceback
-                    print(f"[UPLOAD][ERROR] Large file upload failed:\n{traceback.format_exc()}")
+                    tb = traceback.format_exc()
+                    print(f"[UPLOAD][ERROR] Large file upload failed:\n{tb}")
+                    up_status.update(label=f"❌ Upload failed", state="error", expanded=True)
                     st.error(f"Upload failed: {e}")
                     st.session_state.pending_upload = None
         else:
             print(f"[UPLOAD][4] Small file path: reading bytes into session_state...")
             import time as _time
-            t0 = _time.time()
-            file_bytes = uploaded_file.read()
-            print(f"[UPLOAD][5] Widget read complete: {len(file_bytes)} bytes in {_time.time()-t0:.2f}s")
+            with st.spinner(f"📥 Reading {file_name}..."):
+                t0 = _time.time()
+                file_bytes = uploaded_file.read()
+                print(f"[UPLOAD][5] Widget read complete: {len(file_bytes)} bytes in {_time.time()-t0:.2f}s")
             st.session_state.pending_upload = {
                 "file_bytes": file_bytes,
                 "file_name": file_name,
