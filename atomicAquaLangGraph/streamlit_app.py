@@ -543,57 +543,34 @@ if st.session_state.pending_upload:
     file_name  = upload_info["file_name"]
     file_size  = upload_info["file_size"]
 
-    import threading, time
-    # Capture session_id NOW on the main thread — background threads cannot access st.session_state
     file_session_id = st.session_state.session_id
 
-    # Show immediate feedback BEFORE processing starts
-    file_status_placeholder = st.empty()
-    with file_status_placeholder.container():
-        with st.chat_message("assistant", avatar="🛰"):
-            st.markdown(f"*📂 Parsing {file_name} ({file_size/1024:.0f} KB)...*")
+    # Process the file directly inside st.spinner — no blocking poll loop.
+    # The previous approach used a while/sleep loop on the main thread which
+    # starved Streamlit 1.58's Starlette/uvicorn event loop and caused
+    # ClientDisconnect errors on the still-open upload connection.
+    with st.chat_message("assistant", avatar="🛰"):
+        with st.spinner(f"📂 Parsing {file_name} ({file_size/1024:.0f} KB)..."):
+            try:
+                if file_size <= SIZE_THRESHOLD:
+                    file_b64 = base64.b64encode(file_bytes).decode("utf-8")
+                    response = asyncio.run(agent_invoke({
+                        "file": file_b64, "filename": file_name,
+                        "session_id": file_session_id,
+                    }))
+                else:
+                    s3_key = upload_to_s3_with_progress(file_bytes, file_name)
+                    response = asyncio.run(agent_invoke({
+                        "s3_key": s3_key, "filename": file_name,
+                        "session_id": file_session_id,
+                    }))
+                result_text = response.get("result", str(response)) if response else "Error processing file."
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                result_text = f"Error processing file: {str(e)}"
 
-    result_container = {"response": None, "done": False}
-
-    def run_file_agent():
-        try:
-            if file_size <= SIZE_THRESHOLD:
-                file_b64 = base64.b64encode(file_bytes).decode("utf-8")
-                result_container["response"] = asyncio.run(agent_invoke({
-                    "file": file_b64, "filename": file_name,
-                    "session_id": file_session_id,
-                }))
-            else:
-                s3_key = upload_to_s3_with_progress(file_bytes, file_name)
-                result_container["response"] = asyncio.run(agent_invoke({
-                    "s3_key": s3_key, "filename": file_name,
-                    "session_id": file_session_id,
-                }))
-        except Exception as e:
-            import traceback
-            print(f"[ERROR] File upload failed: {traceback.format_exc()}")
-            result_container["response"] = {"result": f"Error processing file: {str(e)}"}
-        result_container["done"] = True
-
-    file_thread = threading.Thread(target=run_file_agent, daemon=True)
-    file_thread.start()
-
-    # Poll for status while processing (reuse the placeholder created above)
-    last_status = f"📂 Parsing {file_name} ({file_size/1024:.0f} KB)..."
-    while not result_container["done"]:
-        current_status = agent_get_status(file_session_id)
-        if not current_status:
-            current_status = f"Processing {file_name}..." if file_size <= SIZE_THRESHOLD else f"Uploading {file_name} to cloud..."
-        if current_status != last_status:
-            with file_status_placeholder.container():
-                with st.chat_message("assistant", avatar="🛰"):
-                    st.markdown(f"*{current_status}*")
-            last_status = current_status
-        time.sleep(0.3)
-
-    file_status_placeholder.empty()
-    response = result_container["response"]
-    st.session_state.chat.append(("agent", response.get("result", str(response)) if response else "Error processing file."))
+    st.session_state.chat.append(("agent", result_text))
     st.rerun()
 
 # ── Handle typed message ──────────────────────────────────────────────
@@ -683,7 +660,7 @@ if st.session_state.pending_scint_run:
     def _scint_tokens():
         while True:
             try:
-                typ, dat = scint_queue.get(timeout=300)  # 5 min — scintillation pipeline can be slow
+                typ, dat = scint_queue.get(timeout=1000)  # 5 min — scintillation pipeline can be slow
                 if typ == "token":
                     yield dat
                 elif typ == "done":

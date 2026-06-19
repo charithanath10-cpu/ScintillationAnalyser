@@ -12,7 +12,6 @@ langgraph-prebuilt==1.1.0
 
 pandas==3.0.3
 numpy==2.4.6
-pyarrow==24.0.0
 
 requests==2.34.2
 beautifulsoup4==4.15.0
