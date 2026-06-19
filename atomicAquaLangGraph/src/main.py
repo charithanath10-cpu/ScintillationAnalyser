@@ -293,6 +293,8 @@ _log_store: dict[str, dict] = {}
 # ── Scintillation: raw file bytes kept per session (no disk I/O) ──────
 # Populated by ingest_log_file; consumed by run_scintillation_analysis.
 _scint_bytes_store: dict[str, bytes] = {}
+# For large S3 files, store the key instead of bytes to avoid OOM.
+_scint_s3_key_store: dict[str, str] = {}
 
 _ASCII_FULL_RE = re.compile(
     r"^#(?P<log_name>[A-Z0-9_]+),"
@@ -557,11 +559,14 @@ def ingest_log_file(file_bytes: bytes, filename: str, session_id: str) -> dict:
     t0   = time.time()
     text = file_bytes.decode("utf-8", errors="replace")
     df   = parse_novatel_ascii(text)
+    del text  # free the decoded string — DataFrame has what we need
     summary = _summarize_log(df, filename)
     events  = _build_event_index(df)
     _log_store[session_id] = {"df": df, "summary": summary, "filename": filename, "events": events}
-    # Keep raw bytes in memory for scintillation analysis (no disk write)
-    _scint_bytes_store[session_id] = file_bytes
+    # Only keep raw bytes for small files — large files (>5 MB) use S3 key path
+    # and set _scint_bytes_store themselves (or use _scint_s3_key_store).
+    if len(file_bytes) <= SIZE_THRESHOLD:
+        _scint_bytes_store[session_id] = file_bytes
     # Clear docs cache on new file upload
     _docs_cache.clear()
     print(f"[INGEST] {filename} parsed {len(df)} records session={session_id} took={time.time()-t0:.2f}s")
@@ -1981,21 +1986,37 @@ def run_scintillation_analysis(session_id: str, user_question: str):
     """
     Streaming generator: run the full in-memory scintillation pipeline and
     yield LLM tokens as the response.
-
-    Called only after the user has selected "Open Sky" in the Streamlit UI.
-    The raw file bytes are retrieved from _scint_bytes_store (populated at
-    ingest time) — nothing is written to disk.
     """
     file_bytes = _scint_bytes_store.get(session_id)
+
+    # Large S3 files don't keep bytes in memory — re-fetch on demand
     if not file_bytes:
-        yield "No log file found in this session. Please upload a file first."
-        return
+        s3_key = _scint_s3_key_store.get(session_id)
+        if s3_key:
+            set_status(session_id, "Re-fetching file from S3 for scintillation analysis...")
+            print(f"[SCINTILLATION] Re-fetching from S3: {s3_key}")
+            try:
+                import io as _io
+                obj = get_s3_client().get_object(Bucket=S3_BUCKET, Key=s3_key)
+                buf = _io.BytesIO()
+                for chunk in obj["Body"].iter_chunks(chunk_size=8 * 1024 * 1024):
+                    buf.write(chunk)
+                file_bytes = buf.getvalue()
+                del buf
+                print(f"[SCINTILLATION] Re-fetched {len(file_bytes)} bytes from S3")
+            except Exception as e:
+                yield f"Failed to retrieve file from S3 for scintillation analysis: {e}"
+                return
+        else:
+            yield "No log file found in this session. Please upload a file first."
+            return
 
     set_status(session_id, "Running scintillation pipeline...")
     print(f"[SCINTILLATION] starting analysis session={session_id}")
     t0 = time.time()
 
     summary = scint_analyse_bytes(file_bytes, environment_type="OPEN_SKY")
+    del file_bytes  # free RAM — pipeline has extracted what it needs into summary
 
     if summary.get("pipeline_error"):
         yield (
@@ -2053,16 +2074,41 @@ async def invoke(payload):
 
     elif s3_key_in:
         try:
+            # Stream from S3 in chunks to avoid holding 315 MB + a copy in RAM simultaneously.
+            # boto3 streaming body is an iterator — we read it in 8 MB chunks directly into
+            # a bytearray, avoiding a second full copy that obj["Body"].read() would create.
+            import io as _io
+            print(f"[S3] Streaming {s3_key_in} from bucket {S3_BUCKET}...")
+            t0 = time.time()
             obj = get_s3_client().get_object(Bucket=S3_BUCKET, Key=s3_key_in)
-            file_bytes = obj["Body"].read()
+            content_length = obj.get("ContentLength", 0)
+            buf = _io.BytesIO()
+            chunk_size = 8 * 1024 * 1024  # 8 MB chunks
+            bytes_read = 0
+            for chunk in obj["Body"].iter_chunks(chunk_size=chunk_size):
+                buf.write(chunk)
+                bytes_read += len(chunk)
+            file_bytes = buf.getvalue()
+            del buf
+            print(f"[S3] Streamed {bytes_read} bytes in {time.time()-t0:.2f}s")
+
             file_bytes, filename = preprocess_file(file_bytes, filename)
             info = ingest_log_file(file_bytes, filename, session_id)
+
+            # For S3 files, don't keep full bytes in scint_bytes_store — too much RAM.
+            # Store the s3_key instead so scintillation analysis can re-fetch on demand.
+            _scint_bytes_store[session_id] = None  # clear any bytes
+            _scint_s3_key_store[session_id] = s3_key_in  # store key for re-fetch
+
+            del file_bytes  # release RAM — data is now in _log_store as parsed DataFrame
             return {
                 "result": f"Parsed '{info['filename']}': {info['records']} records across "
                           f"{info['log_types']} log types. Ask me anything about this file.",
                 "summary": info["summary"],
             }
         except Exception as e:
+            import traceback
+            print(f"[S3] Error: {traceback.format_exc()}")
             return {"result": f"Error reading from S3: {e}"}
 
     # ── Q&A path ─────────────────────────────────────────────────────
