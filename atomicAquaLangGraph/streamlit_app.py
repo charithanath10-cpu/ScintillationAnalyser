@@ -580,36 +580,80 @@ if st.session_state.pending_upload:
     print(f"[PROCESS][1] Processing pending upload: {file_name} ({file_size/1024/1024:.1f} MB) path={path_type} session={file_session_id}")
 
     with st.chat_message("assistant", avatar="🛰"):
-        with st.spinner(f"📂 Parsing {file_name}..."):
-            try:
-                import time as _time
-                t0 = _time.time()
-                if "s3_key" in upload_info:
-                    print(f"[PROCESS][2] Calling agent_invoke with s3_key={upload_info['s3_key']}")
-                    response = asyncio.run(agent_invoke({
-                        "s3_key": upload_info["s3_key"],
-                        "filename": file_name,
-                        "session_id": file_session_id,
-                    }))
+        # Use st.status so we can send live updates to the browser every few seconds.
+        # This keeps the WebSocket alive during long operations (parsing 300 MB files
+        # takes 130+ seconds which exceeds Streamlit Cloud's idle WebSocket timeout).
+        with st.status(f"📂 Processing {file_name}...", expanded=True) as status_box:
+            import threading, time as _time, queue as _queue
+
+            result_q = _queue.Queue()
+
+            def _invoke_background():
+                try:
+                    import time as _t
+                    t0 = _t.time()
+                    print(f"[PROCESS][2] Background thread: calling agent_invoke path={path_type}")
+                    if "s3_key" in upload_info:
+                        response = asyncio.run(agent_invoke({
+                            "s3_key": upload_info["s3_key"],
+                            "filename": file_name,
+                            "session_id": file_session_id,
+                        }))
+                    else:
+                        file_b64 = base64.b64encode(upload_info["file_bytes"]).decode("utf-8")
+                        response = asyncio.run(agent_invoke({
+                            "file": file_b64,
+                            "filename": file_name,
+                            "session_id": file_session_id,
+                        }))
+                    elapsed = _t.time() - t0
+                    print(f"[PROCESS][4] agent_invoke complete in {elapsed:.2f}s")
+                    result_q.put(("ok", response))
+                except Exception as e:
+                    import traceback
+                    tb = traceback.format_exc()
+                    print(f"[PROCESS][ERROR] agent_invoke failed:\n{tb}")
+                    result_q.put(("error", str(e), tb))
+
+            thread = threading.Thread(target=_invoke_background, daemon=True)
+            thread.start()
+
+            # Heartbeat loop — updates st.status every 3s to keep WebSocket alive
+            _steps = [
+                "⬆️ File received",
+                "🔍 Parsing log records...",
+                "📊 Indexing telemetry events...",
+                "🧠 Analysing file content...",
+                "✅ Almost done...",
+            ]
+            _step_idx = 0
+            _elapsed = 0
+            st.write(_steps[0])
+
+            while thread.is_alive():
+                _time.sleep(3)
+                _elapsed += 3
+                if _step_idx < len(_steps) - 1:
+                    _step_idx += 1
+                    st.write(f"{_steps[_step_idx]} ({_elapsed}s)")
                 else:
-                    print(f"[PROCESS][2] Base64-encoding {len(upload_info['file_bytes'])} bytes...")
-                    file_b64 = base64.b64encode(upload_info["file_bytes"]).decode("utf-8")
-                    del upload_info
-                    print(f"[PROCESS][3] Calling agent_invoke with file b64 ({len(file_b64)} chars)")
-                    response = asyncio.run(agent_invoke({
-                        "file": file_b64,
-                        "filename": file_name,
-                        "session_id": file_session_id,
-                    }))
-                elapsed = _time.time() - t0
-                print(f"[PROCESS][4] agent_invoke complete in {elapsed:.2f}s, response keys={list(response.keys()) if response else None}")
+                    # Keep sending updates so WebSocket stays alive
+                    st.write(f"⏳ Still working... ({_elapsed}s)")
+
+            # Thread finished — get result
+            try:
+                outcome = result_q.get_nowait()
+            except _queue.Empty:
+                outcome = ("error", "No response from agent", "")
+
+            if outcome[0] == "ok":
+                response = outcome[1]
                 result_text = response.get("result", str(response)) if response else "Error processing file."
                 print(f"[PROCESS][5] result_text length={len(result_text)} chars")
-            except Exception as e:
-                import traceback
-                tb = traceback.format_exc()
-                print(f"[PROCESS][ERROR] agent_invoke failed:\n{tb}")
-                result_text = f"Error processing file: {str(e)}\n\n```\n{tb}\n```"
+                status_box.update(label=f"✅ {file_name} processed", state="complete", expanded=False)
+            else:
+                result_text = f"Error processing file: {outcome[1]}\n\n```\n{outcome[2]}\n```"
+                status_box.update(label=f"❌ Processing failed", state="error", expanded=True)
 
     print(f"[PROCESS][6] Appending result to chat, calling st.rerun()")
     st.session_state.chat.append(("agent", result_text))
