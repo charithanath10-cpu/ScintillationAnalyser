@@ -514,54 +514,70 @@ if uploaded_file and uploaded_file.file_id not in st.session_state.get("processe
     if file_size > MAX_UPLOAD:
         st.error(f"File is {file_size / (1024*1024):.1f} MB. Max allowed is {MAX_UPLOAD / (1024*1024):.0f} MB.")
     else:
-        # ── STEP 1: Show chip immediately ─────────────────────────────
         size_str = f"{file_size / 1024:.1f} KB" if file_size < 1024 * 1024 else f"{file_size / (1024*1024):.1f} MB"
         file_chip_html = f"""
         <div style="display:inline-flex;align-items:center;gap:7px;
           background:#e8f2fa;border:1px solid #b8d0e8;border-radius:8px;
           padding:6px 12px;font-size:12px;color:#005198;font-family:monospace;position:relative;bottom:3px;">
-          📄&nbsp;<strong>{file_name}</strong>&nbsp;
+          📄&nbsp;<strong>{file_name}</strong>&nbsp;<span class="filesize">{size_str}</span>
         </div>
         """
         st.session_state.chat.append(("file", file_chip_html))
-        # Store the upload info for processing on the next rerun
-        file_bytes = uploaded_file.read()
-        st.session_state.pending_upload = {
-            "file_bytes": file_bytes,
-            "file_name": file_name,
-            "file_size": file_size,
-        }
         st.session_state.session_id = "session-" + uuid.uuid4().hex[:10]
-        st.rerun()  # rerun immediately so chip renders before processing starts
+
+        if file_size > SIZE_THRESHOLD:
+            # Large file: upload to S3 immediately here (upload widget stream is
+            # still open) — store only the S3 key, never put bytes in session_state.
+            with st.spinner(f"⬆️ Uploading {file_name} ({size_str}) to cloud..."):
+                try:
+                    file_bytes = uploaded_file.read()
+                    s3_key = upload_to_s3_with_progress(file_bytes, file_name)
+                    del file_bytes  # free RAM immediately
+                    st.session_state.pending_upload = {
+                        "s3_key": s3_key,
+                        "file_name": file_name,
+                        "file_size": file_size,
+                    }
+                except Exception as e:
+                    st.error(f"Upload failed: {e}")
+                    st.session_state.pending_upload = None
+        else:
+            # Small file (≤5 MB): safe to keep bytes in session_state
+            file_bytes = uploaded_file.read()
+            st.session_state.pending_upload = {
+                "file_bytes": file_bytes,
+                "file_name": file_name,
+                "file_size": file_size,
+            }
+
+        st.rerun()  # rerun so chip renders and processing starts
 
 # ── Process pending upload (runs on the rerun after chip is shown) ────
 if st.session_state.pending_upload:
     upload_info = st.session_state.pending_upload
-    st.session_state.pending_upload = None  # clear so we don't re-process
+    st.session_state.pending_upload = None  # clear immediately — don't keep large data in state
 
-    file_bytes = upload_info["file_bytes"]
     file_name  = upload_info["file_name"]
     file_size  = upload_info["file_size"]
-
     file_session_id = st.session_state.session_id
 
-    # Process the file directly inside st.spinner — no blocking poll loop.
-    # The previous approach used a while/sleep loop on the main thread which
-    # starved Streamlit 1.58's Starlette/uvicorn event loop and caused
-    # ClientDisconnect errors on the still-open upload connection.
     with st.chat_message("assistant", avatar="🛰"):
         with st.spinner(f"📂 Parsing {file_name} ({file_size/1024:.0f} KB)..."):
             try:
-                if file_size <= SIZE_THRESHOLD:
-                    file_b64 = base64.b64encode(file_bytes).decode("utf-8")
+                if "s3_key" in upload_info:
+                    # Large file — already on S3, just pass the key
                     response = asyncio.run(agent_invoke({
-                        "file": file_b64, "filename": file_name,
+                        "s3_key": upload_info["s3_key"],
+                        "filename": file_name,
                         "session_id": file_session_id,
                     }))
                 else:
-                    s3_key = upload_to_s3_with_progress(file_bytes, file_name)
+                    # Small file — bytes already in memory
+                    file_b64 = base64.b64encode(upload_info["file_bytes"]).decode("utf-8")
+                    del upload_info  # free RAM
                     response = asyncio.run(agent_invoke({
-                        "s3_key": s3_key, "filename": file_name,
+                        "file": file_b64,
+                        "filename": file_name,
                         "session_id": file_session_id,
                     }))
                 result_text = response.get("result", str(response)) if response else "Error processing file."
