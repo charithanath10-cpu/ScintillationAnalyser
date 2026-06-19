@@ -505,6 +505,7 @@ user_input = st.chat_input("Ask about NovAtel logs, message formats, GNSS…")
 
 # ── Handle file upload ────────────────────────────────────────────────
 if uploaded_file and uploaded_file.file_id not in st.session_state.get("processed_files", set()):
+    print(f"[UPLOAD][1] File widget triggered: name={uploaded_file.name} size={uploaded_file.size} id={uploaded_file.file_id}")
     if "processed_files" not in st.session_state:
         st.session_state.processed_files = set()
     st.session_state.processed_files.add(uploaded_file.file_id)
@@ -512,8 +513,10 @@ if uploaded_file and uploaded_file.file_id not in st.session_state.get("processe
     file_name = uploaded_file.name
 
     if file_size > MAX_UPLOAD:
+        print(f"[UPLOAD][2] REJECTED: file too large ({file_size} bytes, max {MAX_UPLOAD})")
         st.error(f"File is {file_size / (1024*1024):.1f} MB. Max allowed is {MAX_UPLOAD / (1024*1024):.0f} MB.")
     else:
+        print(f"[UPLOAD][2] Accepted: {file_name} ({file_size/1024/1024:.1f} MB), path=large" if file_size > SIZE_THRESHOLD else f"[UPLOAD][2] Accepted: {file_name} ({file_size/1024:.1f} KB), path=small")
         size_str = f"{file_size / 1024:.1f} KB" if file_size < 1024 * 1024 else f"{file_size / (1024*1024):.1f} MB"
         file_chip_html = f"""
         <div style="display:inline-flex;align-items:center;gap:7px;
@@ -524,68 +527,91 @@ if uploaded_file and uploaded_file.file_id not in st.session_state.get("processe
         """
         st.session_state.chat.append(("file", file_chip_html))
         st.session_state.session_id = "session-" + uuid.uuid4().hex[:10]
+        print(f"[UPLOAD][3] New session_id={st.session_state.session_id}")
 
         if file_size > SIZE_THRESHOLD:
-            # Large file: upload to S3 immediately here (upload widget stream is
-            # still open) — store only the S3 key, never put bytes in session_state.
+            print(f"[UPLOAD][4] Large file path: reading bytes from widget...")
             with st.spinner(f"⬆️ Uploading {file_name} ({size_str}) to cloud..."):
                 try:
+                    import time as _time
+                    t0 = _time.time()
                     file_bytes = uploaded_file.read()
+                    print(f"[UPLOAD][5] Widget read complete: {len(file_bytes)} bytes in {_time.time()-t0:.2f}s")
+                    print(f"[UPLOAD][6] Starting S3 upload to bucket={S3_BUCKET}...")
+                    t1 = _time.time()
                     s3_key = upload_to_s3_with_progress(file_bytes, file_name)
+                    print(f"[UPLOAD][7] S3 upload complete: key={s3_key} in {_time.time()-t1:.2f}s")
                     del file_bytes  # free RAM immediately
                     st.session_state.pending_upload = {
                         "s3_key": s3_key,
                         "file_name": file_name,
                         "file_size": file_size,
                     }
+                    print(f"[UPLOAD][8] pending_upload set with s3_key, calling st.rerun()")
                 except Exception as e:
+                    import traceback
+                    print(f"[UPLOAD][ERROR] Large file upload failed:\n{traceback.format_exc()}")
                     st.error(f"Upload failed: {e}")
                     st.session_state.pending_upload = None
         else:
-            # Small file (≤5 MB): safe to keep bytes in session_state
+            print(f"[UPLOAD][4] Small file path: reading bytes into session_state...")
+            import time as _time
+            t0 = _time.time()
             file_bytes = uploaded_file.read()
+            print(f"[UPLOAD][5] Widget read complete: {len(file_bytes)} bytes in {_time.time()-t0:.2f}s")
             st.session_state.pending_upload = {
                 "file_bytes": file_bytes,
                 "file_name": file_name,
                 "file_size": file_size,
             }
+            print(f"[UPLOAD][6] pending_upload set with file_bytes, calling st.rerun()")
 
-        st.rerun()  # rerun so chip renders and processing starts
+        st.rerun()
 
 # ── Process pending upload (runs on the rerun after chip is shown) ────
 if st.session_state.pending_upload:
     upload_info = st.session_state.pending_upload
-    st.session_state.pending_upload = None  # clear immediately — don't keep large data in state
+    st.session_state.pending_upload = None  # clear immediately
 
     file_name  = upload_info["file_name"]
     file_size  = upload_info["file_size"]
     file_session_id = st.session_state.session_id
+    path_type  = "s3" if "s3_key" in upload_info else "bytes"
+    print(f"[PROCESS][1] Processing pending upload: {file_name} ({file_size/1024/1024:.1f} MB) path={path_type} session={file_session_id}")
 
     with st.chat_message("assistant", avatar="🛰"):
-        with st.spinner(f"📂 Parsing {file_name} ({file_size/1024:.0f} KB)..."):
+        with st.spinner(f"📂 Parsing {file_name}..."):
             try:
+                import time as _time
+                t0 = _time.time()
                 if "s3_key" in upload_info:
-                    # Large file — already on S3, just pass the key
+                    print(f"[PROCESS][2] Calling agent_invoke with s3_key={upload_info['s3_key']}")
                     response = asyncio.run(agent_invoke({
                         "s3_key": upload_info["s3_key"],
                         "filename": file_name,
                         "session_id": file_session_id,
                     }))
                 else:
-                    # Small file — bytes already in memory
+                    print(f"[PROCESS][2] Base64-encoding {len(upload_info['file_bytes'])} bytes...")
                     file_b64 = base64.b64encode(upload_info["file_bytes"]).decode("utf-8")
-                    del upload_info  # free RAM
+                    del upload_info
+                    print(f"[PROCESS][3] Calling agent_invoke with file b64 ({len(file_b64)} chars)")
                     response = asyncio.run(agent_invoke({
                         "file": file_b64,
                         "filename": file_name,
                         "session_id": file_session_id,
                     }))
+                elapsed = _time.time() - t0
+                print(f"[PROCESS][4] agent_invoke complete in {elapsed:.2f}s, response keys={list(response.keys()) if response else None}")
                 result_text = response.get("result", str(response)) if response else "Error processing file."
+                print(f"[PROCESS][5] result_text length={len(result_text)} chars")
             except Exception as e:
                 import traceback
-                traceback.print_exc()
-                result_text = f"Error processing file: {str(e)}"
+                tb = traceback.format_exc()
+                print(f"[PROCESS][ERROR] agent_invoke failed:\n{tb}")
+                result_text = f"Error processing file: {str(e)}\n\n```\n{tb}\n```"
 
+    print(f"[PROCESS][6] Appending result to chat, calling st.rerun()")
     st.session_state.chat.append(("agent", result_text))
     st.rerun()
 
