@@ -77,7 +77,26 @@ MAX_RESULTS     = int(os.getenv("MAX_RESULTS", "15"))
 EXPANSION_PAGES = int(os.getenv("EXPANSION_PAGES", "2"))
 _LLM_COLS       = {"element_id", "element_type", "content_markdown", "page_number"}
 
-app = BedrockAgentCoreApp()
+# BedrockAgentCoreApp is only needed when running as a standalone AgentCore deployment.
+# When imported by Streamlit, instantiating it would attempt AWS service calls at
+# import time and crash if AgentCore credentials are not configured.
+# We defer construction to __main__ only.
+_agentcore_app = None
+
+def _get_agentcore_app():
+    global _agentcore_app
+    if _agentcore_app is None:
+        _agentcore_app = BedrockAgentCoreApp()
+    return _agentcore_app
+
+# Compatibility shim so @app.entrypoint and app.run() still work
+class _AppProxy:
+    def entrypoint(self, fn):
+        return _get_agentcore_app().entrypoint(fn)
+    def run(self):
+        return _get_agentcore_app().run()
+
+app = _AppProxy()
 
 # ── Status tracking for UI updates ───────────────────────────────────
 _current_status: dict[str, str] = {}
