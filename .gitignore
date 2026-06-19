@@ -1,0 +1,37 @@
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Environment variables and secrets
+.env
+.env.local
+.streamlit/secrets.toml
+atomicAquaLangGraph/.env
+atomicAquaLangGraph/.streamlit/secrets.toml
+
+# Bedrock AgentCore build artifacts
+.bedrock_agentcore/
+atomicAquaLangGraph/.bedrock_agentcore/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
