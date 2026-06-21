@@ -9,6 +9,7 @@ sys.path.append(os.path.abspath("."))
 os.environ.setdefault("S3_BUCKET", "naspocuser-s3")
 os.environ.setdefault("AWS_REGION", "ap-south-1")
 os.environ.setdefault("KB_ID", "FH00WKSBPL")
+os.environ.setdefault("PROCESSOR_LAMBDA", "novatel_processor")
 
 import streamlit as st
 import uuid
@@ -29,6 +30,14 @@ from src.main import (
     save_to_memory,
 )
 from src.scintillation_handler import is_scintillation_question
+from src.lambda_client import (
+    invoke_processor_async,
+    wait_for_result,
+    cleanup_result,
+)
+
+# Lambda processing is used for files above this size to keep Streamlit RAM free
+LAMBDA_THRESHOLD = 5 * 1024 * 1024   # 5 MB — same as S3 threshold
 
 S3_BUCKET      = os.environ.get("S3_BUCKET", "naspocuser-s3")
 S3_REGION      = os.environ.get("AWS_REGION", "ap-south-1")
@@ -597,89 +606,131 @@ if uploaded_file and uploaded_file.file_id not in st.session_state.get("processe
 # ── Process pending upload (runs on the rerun after chip is shown) ────
 if st.session_state.pending_upload:
     upload_info = st.session_state.pending_upload
-    st.session_state.pending_upload = None  # clear immediately
+    st.session_state.pending_upload = None
 
-    file_name  = upload_info["file_name"]
-    file_size  = upload_info["file_size"]
+    file_name       = upload_info["file_name"]
+    file_size       = upload_info["file_size"]
     file_session_id = st.session_state.session_id
-    path_type  = "s3" if "s3_key" in upload_info else "bytes"
-    print(f"[PROCESS][1] Processing pending upload: {file_name} ({file_size/1024/1024:.1f} MB) path={path_type} session={file_session_id}")
+    path_type       = "s3" if "s3_key" in upload_info else "bytes"
+    print(f"[PROCESS][1] Processing: {file_name} ({file_size/1024/1024:.1f} MB) path={path_type} session={file_session_id}")
 
     with st.chat_message("assistant", avatar="🛰"):
-        # Use st.status so we can send live updates to the browser every few seconds.
-        # This keeps the WebSocket alive during long operations (parsing 300 MB files
-        # takes 130+ seconds which exceeds Streamlit Cloud's idle WebSocket timeout).
-        with st.status(f"📂 Processing {file_name}...", expanded=True) as status_box:
-            import threading, time as _time, queue as _queue
+        if "s3_key" in upload_info:
+            # ── Large file: offload to Lambda ─────────────────────────
+            # Lambda runs in its own isolated process with up to 3 GB RAM.
+            # Streamlit just polls S3 every 3s — zero DataFrame RAM here.
+            with st.status(f"📂 Processing {file_name}...", expanded=True) as status_box:
+                st.write(f"🚀 Sending to processing service...")
+                print(f"[PROCESS][2] Invoking Lambda async for s3_key={upload_info['s3_key']}")
 
-            result_q = _queue.Queue()
+                invoked = invoke_processor_async(
+                    s3_key=upload_info["s3_key"],
+                    filename=file_name,
+                    session_id=file_session_id,
+                )
 
-            def _invoke_background():
-                try:
-                    import time as _t
-                    t0 = _t.time()
-                    print(f"[PROCESS][2] Background thread: calling agent_invoke path={path_type}")
-                    if "s3_key" in upload_info:
-                        response = asyncio.run(agent_invoke({
-                            "s3_key": upload_info["s3_key"],
-                            "filename": file_name,
-                            "session_id": file_session_id,
-                        }))
+                if not invoked:
+                    # Lambda not configured — fall back to in-process with heartbeat
+                    print(f"[PROCESS][WARN] Lambda not available, falling back to in-process")
+                    st.write(f"⚠️ Processing locally (Lambda not configured)...")
+                    import threading, time as _time, queue as _queue
+                    result_q = _queue.Queue()
+
+                    def _s3_background():
+                        try:
+                            import time as _t
+                            response = asyncio.run(agent_invoke({
+                                "s3_key": upload_info["s3_key"],
+                                "filename": file_name,
+                                "session_id": file_session_id,
+                            }))
+                            result_q.put(("ok", response))
+                        except Exception as e:
+                            import traceback
+                            result_q.put(("error", str(e), traceback.format_exc()))
+
+                    _thread = threading.Thread(target=_s3_background, daemon=True)
+                    _thread.start()
+                    _elapsed = 0
+                    _steps = ["🔍 Parsing records...", "📊 Indexing events...",
+                              "🧠 Analysing...", "✅ Almost done..."]
+                    _si = 0
+                    while _thread.is_alive():
+                        _time.sleep(3); _elapsed += 3
+                        msg = _steps[min(_si, len(_steps)-1)]
+                        st.write(f"{msg} ({_elapsed}s)"); _si += 1
+                    try:
+                        outcome = result_q.get_nowait()
+                    except _queue.Empty:
+                        outcome = ("error", "Timeout", "")
+                    if outcome[0] == "ok":
+                        result_text = outcome[1].get("result", str(outcome[1])) if outcome[1] else "Error."
+                        status_box.update(label=f"✅ {file_name} processed", state="complete", expanded=False)
                     else:
+                        result_text = f"Error: {outcome[1]}\n\n```\n{outcome[2]}\n```"
+                        status_box.update(label=f"❌ Processing failed", state="error", expanded=True)
+                else:
+                    # Lambda invoked — poll S3 for result
+                    st.write(f"⏳ Processing in background — this may take a minute for large files...")
+                    print(f"[PROCESS][3] Polling S3 for Lambda result...")
+
+                    result = wait_for_result(file_session_id, status_callback=lambda m: st.write(m))
+                    cleanup_result(file_session_id)
+
+                    if result.get("type") == "error":
+                        result_text = result["result"]
+                        status_box.update(label=f"❌ Processing failed", state="error", expanded=True)
+                    else:
+                        result_text = result.get("result", "File processed.")
+                        status_box.update(label=f"✅ {file_name} processed", state="complete", expanded=False)
+                    print(f"[PROCESS][4] Lambda result received, type={result.get('type')}")
+        else:
+            # ── Small file: process in-process with heartbeat ─────────
+            with st.status(f"📂 Processing {file_name}...", expanded=True) as status_box:
+                import threading, time as _time, queue as _queue
+                result_q = _queue.Queue()
+
+                def _invoke_background():
+                    try:
+                        import time as _t
+                        t0 = _t.time()
+                        print(f"[PROCESS][2] Small file: agent_invoke in background thread")
                         file_b64 = base64.b64encode(upload_info["file_bytes"]).decode("utf-8")
                         response = asyncio.run(agent_invoke({
                             "file": file_b64,
                             "filename": file_name,
                             "session_id": file_session_id,
                         }))
-                    elapsed = _t.time() - t0
-                    print(f"[PROCESS][4] agent_invoke complete in {elapsed:.2f}s")
-                    result_q.put(("ok", response))
-                except Exception as e:
-                    import traceback
-                    tb = traceback.format_exc()
-                    print(f"[PROCESS][ERROR] agent_invoke failed:\n{tb}")
-                    result_q.put(("error", str(e), tb))
+                        print(f"[PROCESS][4] agent_invoke complete in {_t.time()-t0:.2f}s")
+                        result_q.put(("ok", response))
+                    except Exception as e:
+                        import traceback
+                        print(f"[PROCESS][ERROR]\n{traceback.format_exc()}")
+                        result_q.put(("error", str(e), traceback.format_exc()))
 
-            thread = threading.Thread(target=_invoke_background, daemon=True)
-            thread.start()
-
-            # Heartbeat loop — updates st.status every 3s to keep WebSocket alive
-            _steps = [
-                "⬆️ File received",
-                "🔍 Parsing log records...",
-                "📊 Indexing telemetry events...",
-                "🧠 Analysing file content...",
-                "✅ Almost done...",
-            ]
-            _step_idx = 0
-            _elapsed = 0
-            st.write(_steps[0])
-
-            while thread.is_alive():
-                _time.sleep(3)
-                _elapsed += 3
-                if _step_idx < len(_steps) - 1:
-                    _step_idx += 1
-                    st.write(f"{_steps[_step_idx]} ({_elapsed}s)")
+                thread = threading.Thread(target=_invoke_background, daemon=True)
+                thread.start()
+                _steps = ["⬆️ File received", "🔍 Parsing records...",
+                          "📊 Indexing events...", "🧠 Analysing..."]
+                _step_idx, _elapsed = 0, 0
+                st.write(_steps[0])
+                while thread.is_alive():
+                    _time.sleep(3); _elapsed += 3
+                    if _step_idx < len(_steps) - 1:
+                        _step_idx += 1
+                        st.write(f"{_steps[_step_idx]} ({_elapsed}s)")
+                    else:
+                        st.write(f"⏳ Still working... ({_elapsed}s)")
+                try:
+                    outcome = result_q.get_nowait()
+                except _queue.Empty:
+                    outcome = ("error", "No response", "")
+                if outcome[0] == "ok":
+                    result_text = outcome[1].get("result", str(outcome[1])) if outcome[1] else "Error."
+                    status_box.update(label=f"✅ {file_name} processed", state="complete", expanded=False)
                 else:
-                    # Keep sending updates so WebSocket stays alive
-                    st.write(f"⏳ Still working... ({_elapsed}s)")
-
-            # Thread finished — get result
-            try:
-                outcome = result_q.get_nowait()
-            except _queue.Empty:
-                outcome = ("error", "No response from agent", "")
-
-            if outcome[0] == "ok":
-                response = outcome[1]
-                result_text = response.get("result", str(response)) if response else "Error processing file."
-                print(f"[PROCESS][5] result_text length={len(result_text)} chars")
-                status_box.update(label=f"✅ {file_name} processed", state="complete", expanded=False)
-            else:
-                result_text = f"Error processing file: {outcome[1]}\n\n```\n{outcome[2]}\n```"
-                status_box.update(label=f"❌ Processing failed", state="error", expanded=True)
+                    result_text = f"Error: {outcome[1]}\n\n```\n{outcome[2]}\n```"
+                    status_box.update(label=f"❌ Processing failed", state="error", expanded=True)
 
     print(f"[PROCESS][6] Appending result to chat, calling st.rerun()")
     st.session_state.chat.append(("agent", result_text))
