@@ -28,10 +28,13 @@ from src.main import (
     run_correlation_pipeline_streaming,
     run_scintillation_analysis,
     save_to_memory,
+    ingest_log_file,
+    preprocess_file,
 )
 from src.scintillation_handler import is_scintillation_question
+from src.lambda_client import invoke_processor as lambda_invoke
 
-# Lambda processing is used for files above this size to keep Streamlit RAM free
+# Files above this size are processed by Lambda (offloads heavy RAM usage)
 LAMBDA_THRESHOLD = 5 * 1024 * 1024   # 5 MB — same as S3 threshold
 
 S3_BUCKET      = os.environ.get("S3_BUCKET", "naspocuser-s3")
@@ -619,22 +622,29 @@ if st.session_state.pending_upload:
                 try:
                     import time as _t
                     t0 = _t.time()
+
                     if "s3_key" in upload_info:
-                        print(f"[PROCESS][2] S3 path: agent_invoke s3_key={upload_info['s3_key']}")
-                        response = asyncio.run(agent_invoke({
-                            "s3_key":     upload_info["s3_key"],
-                            "filename":   file_name,
-                            "session_id": file_session_id,
-                        }))
+                        # ── Large file: use Lambda to avoid OOM ───────
+                        print(f"[PROCESS][2] Lambda path: invoking novatel_processor s3_key={upload_info['s3_key']}")
+                        response = lambda_invoke(
+                            s3_key=upload_info["s3_key"],
+                            filename=file_name,
+                            session_id=file_session_id,
+                            question="",  # file ingest only
+                        )
                     else:
-                        print(f"[PROCESS][2] Bytes path: base64-encoding and invoking")
-                        file_b64 = base64.b64encode(upload_info["file_bytes"]).decode("utf-8")
-                        response = asyncio.run(agent_invoke({
+                        # ── Small file: in-process (no Lambda needed) ─
+                        print(f"[PROCESS][2] In-process path: parsing {len(upload_info['file_bytes'])} bytes")
+                        import asyncio as _asyncio, base64 as _b64
+                        file_b64 = _b64.b64encode(upload_info["file_bytes"]).decode("utf-8")
+                        response = _asyncio.run(agent_invoke({
                             "file":       file_b64,
                             "filename":   file_name,
                             "session_id": file_session_id,
                         }))
-                    print(f"[PROCESS][4] agent_invoke complete in {_t.time()-t0:.2f}s")
+
+                    elapsed = _t.time() - t0
+                    print(f"[PROCESS][4] Processing complete in {elapsed:.2f}s")
                     result_q.put(("ok", response))
                 except Exception as e:
                     import traceback
@@ -646,7 +656,7 @@ if st.session_state.pending_upload:
 
             # Heartbeat — keeps WebSocket alive and shows live progress
             _steps = [
-                "⬆️ File received",
+                "⬆️ File received — starting analysis",
                 "🔍 Parsing log records...",
                 "📊 Indexing telemetry events...",
                 "🧠 Analysing file content...",
@@ -661,16 +671,22 @@ if st.session_state.pending_upload:
                     _step_idx += 1
                     st.write(f"{_steps[_step_idx]} ({_elapsed}s)")
                 else:
-                    # Keep sending updates so WebSocket stays alive
                     st.write(f"⏳ Still working... ({_elapsed}s elapsed)")
 
             try:
                 outcome = result_q.get_nowait()
             except _queue.Empty:
-                outcome = ("error", "No response from agent", "")
+                outcome = ("error", "No response from processor", "")
 
             if outcome[0] == "ok":
-                result_text = outcome[1].get("result", str(outcome[1])) if outcome[1] else "Error processing file."
+                resp = outcome[1]
+                # Lambda returns {"done": True, "type": "ingest", "result": "...", "summary": "..."}
+                # agent_invoke returns {"result": "...", "summary": "..."}
+                result_text = (
+                    resp.get("result")
+                    if isinstance(resp, dict)
+                    else str(resp)
+                ) or "Error processing file."
                 print(f"[PROCESS][5] result length={len(result_text)} chars")
                 status_box.update(label=f"✅ {file_name} processed", state="complete", expanded=False)
             else:

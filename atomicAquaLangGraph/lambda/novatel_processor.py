@@ -1,22 +1,31 @@
 """
 novatel_processor.py — AWS Lambda function for heavy NovAtel log processing.
 
-Triggered by Streamlit via direct Lambda invocation (not S3 event).
-Reads the log file from S3, runs full parse + analysis, writes result JSON
-back to S3 at results/{session_id}.json.
+Invoked SYNCHRONOUSLY (RequestResponse) by Streamlit so the result is
+returned directly — no S3 polling required.
 
-Streamlit polls S3 for results/{session_id}.json every few seconds.
+Payload:
+    {
+        "s3_key":     "logs/myfile.ASCII",
+        "filename":   "myfile.ASCII",
+        "session_id": "session-abc123",
+        "question":   ""   # empty = file ingest only; non-empty = file ingest + Q&A
+    }
 
-Environment variables required:
-    S3_BUCKET          — bucket name (same as Streamlit app)
-    BEDROCK_MODEL_ID   — e.g. us.anthropic.claude-sonnet-4-6
-    AWS_REGION         — e.g. us-east-1
-    KB_ID              — Bedrock Knowledge Base ID
+Response body (JSON-encoded string inside Lambda response):
+    {
+        "done":       true,
+        "type":       "ingest" | "qa" | "error",
+        "result":     "<markdown text>",
+        "summary":    "<file summary string>",    # ingest only
+        "session_id": "..."
+    }
 
 Lambda config recommended:
-    Memory : 3008 MB  (parsing 300 MB file needs ~600 MB headroom)
-    Timeout: 900 s    (15 minutes)
+    Memory : 3008 MB
+    Timeout: 900 s (15 minutes)
     Runtime: python3.11
+    Handler: novatel_processor.handler
 """
 
 import json
@@ -26,62 +35,29 @@ import time
 import traceback
 import boto3
 
-# ── bootstrap src/ onto path so we can reuse existing modules ────────
-# Lambda expects the zip to contain lambda/novatel_processor.py + src/
+# ── bootstrap /var/task so src.* imports resolve ──────────────────────
 sys.path.insert(0, "/var/task")
 
-S3_BUCKET = os.environ["S3_BUCKET"]
-REGION    = os.environ.get("AWS_REGION", "us-east-1")
+S3_BUCKET = os.environ.get("S3_BUCKET", "naspocuser-s3")
+REGION    = os.environ.get("AWS_REGION", "ap-south-1")
 
 _s3 = boto3.client("s3", region_name=REGION)
 
 
-def _write_status(session_id: str, status: str, pct: int = 0):
-    """Write a lightweight status JSON to S3 so Streamlit can poll it."""
-    key = f"results/{session_id}_status.json"
-    _s3.put_object(
-        Bucket=S3_BUCKET,
-        Key=key,
-        Body=json.dumps({"status": status, "pct": pct, "done": False}),
-        ContentType="application/json",
-    )
-
-
-def _write_result(session_id: str, result: dict):
-    """Write the final result JSON to S3."""
-    key = f"results/{session_id}.json"
-    _s3.put_object(
-        Bucket=S3_BUCKET,
-        Key=key,
-        Body=json.dumps(result, default=str),
-        ContentType="application/json",
-    )
-
-
 def handler(event, context):
     """
-    Lambda entry point.
-
-    Event payload:
-    {
-        "s3_key":     "logs/myfile.ASCII",
-        "filename":   "myfile.ASCII",
-        "session_id": "session-abc123",
-        "question":   ""   # empty string for file ingest; question text for Q&A
-    }
+    Lambda entry point.  Returns result directly (sync invocation).
     """
     session_id = event.get("session_id", "unknown")
     s3_key     = event.get("s3_key", "")
     filename   = event.get("filename", "log.txt")
     question   = event.get("question", "")
 
-    print(f"[LAMBDA] session={session_id} s3_key={s3_key} filename={filename}")
+    print(f"[LAMBDA] START session={session_id} s3_key={s3_key} filename={filename} question={question!r}")
 
     try:
-        # ── Step 1: Read file from S3 ─────────────────────────────────
-        _write_status(session_id, "📥 Reading file from S3...", 5)
+        # ── Step 1: Read file from S3 (chunked, avoids double-copy) ──
         t0 = time.time()
-
         import io
         obj = _s3.get_object(Bucket=S3_BUCKET, Key=s3_key)
         buf = io.BytesIO()
@@ -91,56 +67,57 @@ def handler(event, context):
         del buf
         print(f"[LAMBDA] Read {len(file_bytes)} bytes in {time.time()-t0:.2f}s")
 
-        # ── Step 2: Import processing modules ────────────────────────
-        _write_status(session_id, "🔍 Parsing log records...", 20)
-        from src.main import (
+        # ── Step 2: Import src modules (lazy — first call only) ───────
+        from src.main import (          # noqa: E402
             ingest_log_file,
+            preprocess_file,
             run_correlation_pipeline,
-            _log_store,
         )
 
-        # ── Step 3: Parse + ingest ────────────────────────────────────
+        # ── Step 3: Pre-process (binary → ASCII conversion if needed) ─
+        file_bytes, filename = preprocess_file(file_bytes, filename)
+
+        # ── Step 4: Parse + ingest ────────────────────────────────────
         t1 = time.time()
         info = ingest_log_file(file_bytes, filename, session_id)
-        del file_bytes  # free RAM
+        del file_bytes  # free RAM — DataFrame is in _log_store now
         print(f"[LAMBDA] Ingested {info['records']} records in {time.time()-t1:.2f}s")
 
         if not question:
-            # Pure file ingest — return summary
-            _write_status(session_id, "✅ File parsed successfully", 100)
-            _write_result(session_id, {
-                "done": True,
-                "type": "ingest",
+            # Pure file ingest — return summary immediately
+            result_payload = {
+                "done":       True,
+                "type":       "ingest",
                 "result": (
                     f"Parsed **{info['filename']}**: {info['records']} records across "
                     f"{info['log_types']} log types. Ask me anything about this file."
                 ),
-                "summary": info["summary"],
+                "summary":    info["summary"],
                 "session_id": session_id,
-            })
-            return {"statusCode": 200, "body": "ingest complete"}
+            }
+            print(f"[LAMBDA] ingest complete in {time.time()-t0:.2f}s")
+            return {"statusCode": 200, "body": json.dumps(result_payload, default=str)}
 
-        # ── Step 4: Run Q&A pipeline ──────────────────────────────────
-        _write_status(session_id, "🧠 Running analysis pipeline...", 60)
+        # ── Step 5: Run Q&A pipeline (ingest already populates _log_store) ──
         t2 = time.time()
         answer = run_correlation_pipeline(question, session_id)
-        print(f"[LAMBDA] Pipeline complete in {time.time()-t2:.2f}s")
+        print(f"[LAMBDA] Q&A pipeline complete in {time.time()-t2:.2f}s")
 
-        _write_result(session_id, {
-            "done": True,
-            "type": "qa",
-            "result": answer,
+        result_payload = {
+            "done":       True,
+            "type":       "qa",
+            "result":     answer,
             "session_id": session_id,
-        })
-        return {"statusCode": 200, "body": "qa complete"}
+        }
+        return {"statusCode": 200, "body": json.dumps(result_payload, default=str)}
 
     except Exception as e:
         tb = traceback.format_exc()
         print(f"[LAMBDA][ERROR] {tb}")
-        _write_result(session_id, {
-            "done": True,
-            "type": "error",
-            "result": f"Processing failed: {str(e)}\n\n```\n{tb}\n```",
+        error_payload = {
+            "done":       True,
+            "type":       "error",
+            "result":     f"Processing failed: {str(e)}\n\n```\n{tb}\n```",
             "session_id": session_id,
-        })
-        return {"statusCode": 500, "body": str(e)}
+        }
+        return {"statusCode": 500, "body": json.dumps(error_payload, default=str)}
