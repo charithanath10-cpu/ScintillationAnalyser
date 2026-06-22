@@ -9,7 +9,7 @@ sys.path.append(os.path.abspath("."))
 os.environ.setdefault("S3_BUCKET", "naspocuser-s3")
 os.environ.setdefault("AWS_REGION", "ap-south-1")
 os.environ.setdefault("KB_ID", "FH00WKSBPL")
-os.environ.setdefault("PROCESSOR_LAMBDA", "novatel_processor")
+# Lambda ARN is hardcoded in src/lambda_client.py — no env var needed
 
 import streamlit as st
 import uuid
