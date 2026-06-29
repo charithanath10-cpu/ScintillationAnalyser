@@ -147,9 +147,10 @@ def _handle_ingest(session_id: str, s3_key: str, filename: str):
         os.remove(db_path)
 
     conn = sqlite3.connect(db_path)
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=NORMAL")
-    conn.execute("PRAGMA cache_size=-64000")  # 64 MB cache
+    conn.execute("PRAGMA journal_mode=OFF")   # no WAL file — saves /tmp space
+    conn.execute("PRAGMA synchronous=OFF")
+    conn.execute("PRAGMA temp_store=MEMORY")  # keep temp tables in RAM
+    conn.execute("PRAGMA cache_size=-32000")  # 32 MB cache
 
     # Create tables
     conn.execute("""CREATE TABLE main_log (
@@ -256,17 +257,7 @@ def _handle_ingest(session_id: str, s3_key: str, filename: str):
     conn.commit()
 
     print(f"[INGEST] Streamed {main_count} records to SQLite in {time.time()-t1:.2f}s")
-    _write_status(session_id, "📊 Building indices...", 60)
-
-    # ── Indexes for fast queries ──────────────────────────────────────
-    conn.execute("CREATE INDEX idx_main_log_name ON main_log(log_name)")
-    conn.execute("CREATE INDEX idx_main_week_sec ON main_log(week, seconds)")
-    conn.execute("CREATE INDEX idx_range_prn ON rangea(gps_week, gps_seconds, prn)")
-    conn.execute("CREATE INDEX idx_bestpos_time ON bestpos(gps_week, gps_seconds)")
-    conn.commit()
-
-    # ── Build summary using pandas (load main_log once) ───────────────
-    _write_status(session_id, "📈 Computing summary...", 70)
+    _write_status(session_id, "📊 Building summary...", 70)
     main_df = pd.read_sql("SELECT * FROM main_log", conn)
     summary = _summarize_log(main_df, filename)
     events  = _build_event_index(main_df)
