@@ -290,11 +290,14 @@ def _handle_ingest(session_id: str, s3_key: str, filename: str):
             obs = _parse_range_line(s)
             if obs:
                 tracker.add_obs(obs)
-                # Flush epoch_health rows in batches
-                rows = tracker.get_rows()
-                if len(rows) >= BATCH:
-                    eh_buf.extend(rows); tracker._epoch_rows = []
-                    _fl_epoch_health(); conn.commit()
+                # Every add_obs may complete a previous epoch — drain it immediately
+                rows = tracker._epoch_rows
+                if rows:
+                    eh_buf.extend(rows)
+                    tracker._epoch_rows = []
+                    if len(eh_buf) >= BATCH:
+                        _fl_epoch_health()
+                        conn.commit()
         elif s.startswith("#BESTPOSA,"):
             row = _parse_bestpos_line(s)
             if row:
@@ -308,12 +311,11 @@ def _handle_ingest(session_id: str, s3_key: str, filename: str):
 
     del lines
     tracker.finalize()
-    eh_buf.extend(tracker.get_rows()); tracker._epoch_rows = []
+    eh_buf.extend(tracker._epoch_rows); tracker._epoch_rows = []
     _fl_main(); _fl_bestpos(); _fl_satvis2(); _fl_epoch_health()
     conn.commit()
-    print(f"[INGEST] Streamed {main_count} records + "
-          f"{len(conn.execute('SELECT COUNT(*) FROM epoch_health').fetchone() or [0])} "
-          f"epoch_health rows in {time.time()-t1:.2f}s")
+    eh_count = conn.execute("SELECT COUNT(*) FROM epoch_health").fetchone()[0]
+    print(f"[INGEST] Streamed {main_count} records + {eh_count} epoch_health rows in {time.time()-t1:.2f}s")
 
     _write_status(session_id, "Computing summary...", 70)
     main_df   = pd.read_sql("SELECT * FROM main_log", conn)
