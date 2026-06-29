@@ -470,37 +470,6 @@ def handler(event, context):
             "session_id": session_id,
         })
         return {"statusCode": 500, "body": str(e)}
-
-
-S3 layout:
-  logs/{filename}                          ← raw uploaded file (input)
-  parsed/{session_id}/main.parquet         ← all parsed log records (Q&A)
-  parsed/{session_id}/events.json          ← pre-computed event index
-  parsed/{session_id}/rangea.parquet       ← scintillation: RANGEA obs
-  parsed/{session_id}/bestpos.parquet      ← scintillation: BESTPOS
-  parsed/{session_id}/satvis2.parquet      ← scintillation: SATVIS2
-  parsed/{session_id}/meta.json            ← summary + log_types + filename
-  results/{session_id}.json                ← final answer (done=True)
-  results/{session_id}_status.json         ← live status updates
-  results/{session_id}_stream.txt          ← incremental token stream
-
-Modes:
-  ingest        — parse raw file, write all Parquet, return summary
-  qa            — read main.parquet, run correlation pipeline, stream answer
-  scintillation — read rangea/bestpos/satvis2 Parquet, run scintillation, stream
-
-Memory reduction vs re-parsing:
-  Raw file:      315 MB → parse in memory → peak ~1.9 GB
-  Parquet reads: main.parquet ~15 MB, scint Parquets ~30 MB total
-
-Environment variables:
-    S3_BUCKET, BEDROCK_MODEL_ID, AWS_REGION, KB_ID
-Lambda config:
-    Memory: 3008 MB, Timeout: 900s, Runtime: python3.11
-"""
-
-import json, os, sys, io, time, traceback, gzip
-import boto3
 import pandas as pd
 
 sys.path.insert(0, "/var/task")
