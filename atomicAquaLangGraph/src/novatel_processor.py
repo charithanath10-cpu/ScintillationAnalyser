@@ -32,7 +32,7 @@ Lambda config:
     Memory: 3008 MB, Timeout: 900s, Runtime: python3.11
 """
 
-import json, os, sys, io, time, traceback
+import json, os, sys, io, time, traceback, gzip
 import boto3
 import pandas as pd
 
@@ -71,16 +71,19 @@ def _read_s3_bytes(key: str) -> bytes:
     return data
 
 def _write_parquet(df: pd.DataFrame, key: str):
-    buf = io.BytesIO()
-    df.to_parquet(buf, index=False, engine="pyarrow", compression="snappy")
-    _s3.put_object(Bucket=S3_BUCKET, Key=key, Body=buf.getvalue())
-    print(f"[PARQUET] wrote {key} ({buf.tell()/1024:.0f} KB, {len(df)} rows)")
+    """Write DataFrame as gzipped JSON — no pyarrow needed, fits in Lambda zip."""
+    import gzip
+    buf = gzip.compress(df.to_json(orient="records").encode("utf-8"), compresslevel=1)
+    _s3.put_object(Bucket=S3_BUCKET, Key=key, Body=buf)
+    print(f"[STORE] wrote {key} ({len(buf)/1024:.0f} KB, {len(df)} rows)")
 
 def _read_parquet(key: str) -> pd.DataFrame:
+    """Read DataFrame from gzipped JSON."""
+    import gzip
     obj = _s3.get_object(Bucket=S3_BUCKET, Key=key)
-    buf = io.BytesIO(obj["Body"].read())
-    df  = pd.read_parquet(buf, engine="pyarrow")
-    print(f"[PARQUET] read {key} ({len(df)} rows)")
+    buf = gzip.decompress(obj["Body"].read())
+    df  = pd.read_json(buf, orient="records")
+    print(f"[STORE] read {key} ({len(df)} rows)")
     return df
 
 def _parquet_exists(key: str) -> bool:
@@ -177,10 +180,30 @@ def _handle_ingest(session_id: str, s3_key: str, filename: str):
     # ── Build DataFrames ──────────────────────────────────────────────
     _write_status(session_id, "📊 Building data structures...", 40)
     main_df    = pd.DataFrame(main_records);  del main_records
-    range_df   = pd.DataFrame(range_obs);    del range_obs
-    bestpos_df = pd.DataFrame(bestpos_obs);  del bestpos_obs
-    satvis2_df = pd.DataFrame(satvis2_obs);  del satvis2_obs
-    print(f"[INGEST] DataFrames built in {time.time()-t1:.2f}s total")
+    # For scintillation Parquets, keep only required columns to save RAM + disk
+    _RANGE_COLS   = ["gps_week", "gps_seconds", "prn", "constellation",
+                     "signal", "adr_std", "cn0", "locktime"]
+    _BESTPOS_COLS = ["gps_week", "gps_seconds", "sol_status", "pos_type",
+                     "latitude", "longitude", "height", "lat_std", "lon_std",
+                     "hgt_std", "diff_age", "num_svs", "num_sol_svs"]
+    _SATVIS_COLS  = ["gps_week", "gps_seconds", "constellation", "prn",
+                     "elevation", "azimuth"]
+
+    range_df   = pd.DataFrame(range_obs);   del range_obs
+    bestpos_df = pd.DataFrame(bestpos_obs); del bestpos_obs
+    satvis2_df = pd.DataFrame(satvis2_obs); del satvis2_obs
+
+    # Trim to needed columns only (reduces Parquet size and read RAM)
+    if not range_df.empty:
+        range_df   = range_df[[c for c in _RANGE_COLS   if c in range_df.columns]]
+    if not bestpos_df.empty:
+        bestpos_df = bestpos_df[[c for c in _BESTPOS_COLS if c in bestpos_df.columns]]
+    if not satvis2_df.empty:
+        satvis2_df = satvis2_df[[c for c in _SATVIS_COLS  if c in satvis2_df.columns]]
+
+    print(f"[INGEST] DataFrames built in {time.time()-t1:.2f}s total — "
+          f"main={len(main_df)}, range={len(range_df)}, "
+          f"bestpos={len(bestpos_df)}, satvis2={len(satvis2_df)}")
 
     # ── Write Parquet files to S3 ─────────────────────────────────────
     _write_status(session_id, "💾 Saving parsed data to cloud...", 50)
