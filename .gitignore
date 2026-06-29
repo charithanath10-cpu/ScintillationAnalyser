@@ -35,3 +35,11 @@ Thumbs.db
 .idea/
 *.swp
 *.swo
+
+atomicAquaLangGraph/lambda/_linux/
+atomicAquaLangGraph/lambda/_pkg/
+atomicAquaLangGraph/lambda/_staging/
+atomicAquaLangGraph/lambda/lambda/
+atomicAquaLangGraph/lambda/lambda_package.zip
+atomicAquaLangGraph/lambda/pyarrow_layer.zip
+atomicAquaLangGraph/lambda/wheels/
