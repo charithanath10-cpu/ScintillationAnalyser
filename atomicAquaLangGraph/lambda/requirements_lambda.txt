@@ -1,0 +1,25 @@
+# Pinned versions for Lambda deployment — must match Streamlit app
+# Built for python3.11 / Amazon Linux 2023 / x86_64
+
+boto3==1.37.1
+botocore==1.37.1
+
+langchain==0.3.25
+langchain-core==0.3.58
+langchain-aws==0.2.26
+langgraph==0.2.73
+langgraph-prebuilt==0.1.7
+langchain-community==0.3.24
+
+pydantic==2.10.6
+pydantic-core==2.27.2
+
+pandas==2.2.3
+numpy==1.26.4
+
+bedrock-agentcore==1.15.0
+python-dotenv==1.1.0
+tiktoken==0.9.0
+requests==2.32.3
+beautifulsoup4==4.13.4
+lxml==5.4.0

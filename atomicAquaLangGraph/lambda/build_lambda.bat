@@ -1,63 +1,39 @@
 @echo off
-REM build_lambda.bat — packages novatel_processor.py + src/ into lambda_package.zip
-REM Run this from the atomicAquaLangGraph/ directory:
-REM   cd atomicAquaLangGraph
-REM   lambda\build_lambda.bat
+REM build_lambda.bat — Build Lambda package using Docker (Windows)
+REM Requires Docker Desktop with WSL2 backend running
 
-echo Building Lambda package...
+setlocal
+cd /d "%~dp0"
 
-REM Clean old zip
-if exist lambda\lambda_package.zip del lambda\lambda_package.zip
+echo === Cleaning previous build ===
+if exist _build rmdir /s /q _build
+if exist lambda_package.zip del lambda_package.zip
+mkdir _build
 
-REM Create a temp staging folder
-if exist lambda\_staging rmdir /s /q lambda\_staging
-mkdir lambda\_staging
+echo === Installing dependencies for Amazon Linux 2023 / Python 3.11 ===
+docker run --rm ^
+  -v "%cd%\_build":/out ^
+  -v "%cd%\requirements_lambda.txt":/requirements.txt ^
+  public.ecr.aws/lambda/python:3.11 ^
+  pip install -r /requirements.txt -t /out --no-cache-dir
 
-REM Copy the handler
-copy lambda\novatel_processor.py lambda\_staging\novatel_processor.py
+if errorlevel 1 (
+    echo ERROR: Docker build failed. Is Docker Desktop running?
+    exit /b 1
+)
 
-REM Copy the src folder (minus __pycache__ and .egg-info)
-xcopy src lambda\_staging\src /E /I /Q /EXCLUDE:lambda\xcopy_exclude.txt
+echo === Copying handler and src/ ===
+copy novatel_processor.py _build\
+xcopy /E /I /Q ..\src _build\src
 
-REM Create the exclude list
-echo __pycache__> lambda\xcopy_exclude.txt
-echo .egg-info>> lambda\xcopy_exclude.txt
-echo .pyc>> lambda\xcopy_exclude.txt
+echo === Creating lambda_package.zip ===
+cd _build
+powershell -Command "Compress-Archive -Path * -DestinationPath ..\lambda_package.zip -Force"
+cd ..
 
-REM Install dependencies into the staging folder
-echo Installing dependencies...
-pip install ^
-    boto3 ^
-    langchain==1.3.10 ^
-    langchain-core==1.4.8 ^
-    langchain-aws==1.6.0 ^
-    langgraph==1.2.6 ^
-    langgraph-prebuilt==1.1.0 ^
-    pandas==3.0.3 ^
-    numpy==2.4.6 ^
-    bedrock-agentcore==1.15.0 ^
-    beautifulsoup4==4.15.0 ^
-    lxml==6.1.1 ^
-    python-dotenv==1.2.2 ^
-    tiktoken==0.13.0 ^
-    -t lambda\_staging ^
-    --quiet
-
-REM Zip everything
-echo Zipping...
-powershell -Command "Compress-Archive -Path 'lambda\_staging\*' -DestinationPath 'lambda\lambda_package.zip' -Force"
-
-REM Cleanup staging
-rmdir /s /q lambda\_staging
-
+echo === Done: lambda_package.zip ===
 echo.
-echo Done! lambda\lambda_package.zip is ready to upload to AWS Lambda.
-echo.
-echo Next steps:
-echo   1. Go to AWS Lambda console
-echo   2. Create function: novatel_processor, Runtime: Python 3.11
-echo   3. Memory: 3008 MB, Timeout: 900 seconds
-echo   4. Upload lambda\lambda_package.zip
-echo   5. Set Handler to: novatel_processor.handler
-echo   6. Add env vars: S3_BUCKET, AWS_REGION, BEDROCK_MODEL_ID, KB_ID
-echo   7. Attach IAM role with S3 + Bedrock permissions
+echo Upload to Lambda:
+echo   aws lambda update-function-code --function-name novatel_processor --zip-file fileb://lambda_package.zip --region ap-south-1
+
+endlocal
