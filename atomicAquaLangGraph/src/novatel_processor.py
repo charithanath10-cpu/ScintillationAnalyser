@@ -129,7 +129,7 @@ class _StreamWriter:
 
 def _handle_ingest(session_id: str, s3_key: str, filename: str):
     from src.main import (
-        parse_novatel_ascii, _summarize_log, _build_event_index,
+        _parse_line, _summarize_log, _build_event_index,
         _log_store, _scint_s3_key_store,
     )
     from src.scintillation_log_decoders import (
@@ -141,20 +141,24 @@ def _handle_ingest(session_id: str, s3_key: str, filename: str):
     file_bytes = _read_s3_bytes(s3_key)
     print(f"[INGEST] Read {len(file_bytes)} bytes in {time.time()-t0:.2f}s")
 
-    # ── Parse main log DataFrame ──────────────────────────────────────
     _write_status(session_id, "🔍 Parsing log records...", 15)
     t1 = time.time()
-    text = file_bytes.decode("utf-8", errors="replace")
+    text  = file_bytes.decode("utf-8", errors="replace"); del file_bytes
+    lines = text.splitlines(); del text
 
-    # Parse scintillation-specific logs in the same pass to avoid re-reading
+    # ── Single pass: build all DataFrames simultaneously ──────────────
+    main_records = []
     range_obs, bestpos_obs, satvis2_obs = [], [], []
-    lines = text.splitlines()
-    del text
 
     for line in lines:
         s = line.strip()
         if not s:
             continue
+        # Main log record (all log types)
+        rec = _parse_line(s)
+        if rec:
+            main_records.append(rec)
+        # Scintillation-specific parsers (subset of lines)
         if s.startswith("#RANGEA,"):
             obs = _parse_range_line(s)
             if obs: range_obs.extend(obs)
@@ -162,30 +166,33 @@ def _handle_ingest(session_id: str, s3_key: str, filename: str):
             row = _parse_bestpos_line(s)
             if row: bestpos_obs.append(row)
         elif s.startswith("#SATVIS2A,"):
-            from src.scintillation_log_decoders import _parse_satvis2_line
             sats = _parse_satvis2_line(s)
             if sats: satvis2_obs.extend(sats)
 
-    # Parse main DataFrame from the same raw bytes
-    main_df = parse_novatel_ascii("\n".join(lines))
-    del lines
-    del file_bytes
+    del lines  # free line list before building DataFrames
+    print(f"[INGEST] Single-pass parse done in {time.time()-t1:.2f}s: "
+          f"{len(main_records)} main, {len(range_obs)} range, "
+          f"{len(bestpos_obs)} bestpos, {len(satvis2_obs)} satvis2")
 
-    print(f"[INGEST] Parsed {len(main_df)} records in {time.time()-t1:.2f}s")
+    # ── Build DataFrames ──────────────────────────────────────────────
+    _write_status(session_id, "📊 Building data structures...", 40)
+    main_df    = pd.DataFrame(main_records);  del main_records
+    range_df   = pd.DataFrame(range_obs);    del range_obs
+    bestpos_df = pd.DataFrame(bestpos_obs);  del bestpos_obs
+    satvis2_df = pd.DataFrame(satvis2_obs);  del satvis2_obs
+    print(f"[INGEST] DataFrames built in {time.time()-t1:.2f}s total")
 
-    # ── Write main.parquet ────────────────────────────────────────────
+    # ── Write Parquet files to S3 ─────────────────────────────────────
     _write_status(session_id, "💾 Saving parsed data to cloud...", 50)
     base = f"parsed/{session_id}"
     _write_parquet(main_df, f"{base}/main.parquet")
-
-    # ── Write scintillation Parquets ──────────────────────────────────
-    if range_obs:
-        _write_parquet(pd.DataFrame(range_obs),   f"{base}/rangea.parquet")
-    if bestpos_obs:
-        _write_parquet(pd.DataFrame(bestpos_obs), f"{base}/bestpos.parquet")
-    if satvis2_obs:
-        _write_parquet(pd.DataFrame(satvis2_obs), f"{base}/satvis2.parquet")
-    del range_obs, bestpos_obs, satvis2_obs
+    if not range_df.empty:
+        _write_parquet(range_df,   f"{base}/rangea.parquet")
+    if not bestpos_df.empty:
+        _write_parquet(bestpos_df, f"{base}/bestpos.parquet")
+    if not satvis2_df.empty:
+        _write_parquet(satvis2_df, f"{base}/satvis2.parquet")
+    del range_df, bestpos_df, satvis2_df
 
     # ── Build event index + summary ───────────────────────────────────
     summary = _summarize_log(main_df, filename)
