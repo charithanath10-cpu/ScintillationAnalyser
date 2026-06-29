@@ -776,46 +776,47 @@ if st.session_state.pending_scint_run:
 
     # ── Lambda routing for scintillation ─────────────────────────────
     if st.session_state.lambda_s3_key:
-        from src.lambda_client import invoke_processor_async, poll_result, poll_status, cleanup_result
-        scint_lambda_sid = session_id + "-scint"
-        with st.chat_message("assistant", avatar="🛰"):
-            with st.status("🔬 Running scintillation analysis in cloud...", expanded=True) as scint_status_box:
-                st.write("🚀 Dispatching to cloud processor...")
-                ok = invoke_processor_async(
-                    s3_key=st.session_state.lambda_s3_key,
-                    filename=st.session_state.lambda_filename,
-                    session_id=scint_lambda_sid,
-                    question=scint_question,
-                )
-                if ok:
-                    elapsed, last_msg = 0, ""
-                    result_data = None
-                    while elapsed < 600:
-                        time.sleep(3); elapsed += 3
-                        result_data = poll_result(scint_lambda_sid)
-                        if result_data and result_data.get("done"):
-                            break
-                        sd = poll_status(scint_lambda_sid)
-                        if sd:
-                            msg = sd.get("status", "")
-                            if msg and msg != last_msg:
-                                st.write(f"{msg} ({elapsed}s)"); last_msg = msg
-                        elif elapsed % 9 == 0:
-                            st.write(f"⏳ Still processing... ({elapsed}s)")
-                    if result_data and result_data.get("done"):
-                        scint_text = result_data.get("result", "")
-                        scint_status_box.update(label="✅ Scintillation analysis complete", state="complete", expanded=False)
-                        cleanup_result(scint_lambda_sid)
-                    else:
-                        scint_text = "⚠️ Scintillation analysis timed out."
-                        scint_status_box.update(label="⏰ Timed out", state="error", expanded=False)
-                else:
-                    scint_text = "⚠️ Failed to dispatch to cloud processor."
-                    scint_status_box.update(label="❌ Failed", state="error", expanded=False)
-        st.session_state.chat.append(("agent", scint_text or ""))
-        if scint_text:
-            save_to_memory(session_id, scint_question, scint_text)
-        st.rerun()
+        from src.lambda_client import invoke_processor_async, poll_stream, poll_result, cleanup_result
+        import time as _time
+        scint_lambda_sid = session_id + "-scint-" + str(int(_time.time()))
+
+        ok = invoke_processor_async(
+            s3_key=st.session_state.lambda_s3_key,
+            filename=st.session_state.lambda_filename,
+            session_id=scint_lambda_sid,
+            question=scint_question,
+            mode="scintillation",
+        )
+
+        if ok:
+            def _scint_lambda_stream():
+                last_len = 0
+                start    = _time.time()
+                while _time.time() - start < 600:
+                    _time.sleep(0.5)
+                    result = poll_result(scint_lambda_sid)
+                    if result and result.get("done"):
+                        final = result.get("result", "")
+                        if len(final) > last_len:
+                            yield final[last_len:]
+                        return
+                    stream_text = poll_stream(scint_lambda_sid)
+                    if stream_text and len(stream_text) > last_len:
+                        yield stream_text[last_len:]
+                        last_len = len(stream_text)
+                yield "\n\n⚠️ Scintillation analysis timed out."
+
+            with st.chat_message("assistant"):
+                scint_text = st.write_stream(_scint_lambda_stream())
+
+            scint_text = scint_text or ""
+            cleanup_result(scint_lambda_sid)
+            st.session_state.chat.append(("agent", scint_text))
+            if scint_text:
+                save_to_memory(session_id, scint_question, scint_text)
+            st.rerun()
+        else:
+            st.warning("⚠️ Failed to dispatch to cloud processor.")
 
     # ── Local scintillation pipeline (small files) ────────────────────
     scint_queue = queue.Queue()
@@ -886,56 +887,54 @@ if (
     import threading, time, queue
 
     # ── Lambda routing: file was processed by Lambda → send question there too ──
-    # The parsed DataFrame lives in Lambda's memory, not here.
-    # Re-ingest + answer in one Lambda call.
     if st.session_state.lambda_s3_key:
-        from src.lambda_client import invoke_processor_async, poll_result, poll_status, cleanup_result
-        lambda_session_id = session_id + "-q"   # unique key per question
+        from src.lambda_client import invoke_processor_async, poll_stream, poll_result, cleanup_result
+        import time as _time
+        lambda_session_id = session_id + "-q-" + str(int(_time.time()))
 
-        with st.chat_message("assistant", avatar="🛰"):
-            with st.status("🧠 Analysing in cloud engine...", expanded=True) as status_box:
-                st.write("🚀 Sending question to cloud processor...")
-                ok = invoke_processor_async(
-                    s3_key=st.session_state.lambda_s3_key,
-                    filename=st.session_state.lambda_filename,
-                    session_id=lambda_session_id,
-                    question=user_prompt,
-                )
-                if not ok:
-                    st.write("⚠️ Cloud dispatch failed — falling back to local pipeline...")
-                    # fall through to local pipeline below by clearing lambda_s3_key temporarily
-                    _use_lambda = False
-                else:
-                    _use_lambda = True
-                    elapsed, last_msg = 0, ""
-                    result_data = None
-                    while elapsed < 600:
-                        time.sleep(3); elapsed += 3
-                        result_data = poll_result(lambda_session_id)
-                        if result_data and result_data.get("done"):
-                            break
-                        sd = poll_status(lambda_session_id)
-                        if sd:
-                            msg = sd.get("status", "")
-                            if msg and msg != last_msg:
-                                st.write(f"{msg} ({elapsed}s)"); last_msg = msg
-                        elif elapsed % 9 == 0:
-                            st.write(f"⏳ Still processing... ({elapsed}s)")
+        ok = invoke_processor_async(
+            s3_key=st.session_state.lambda_s3_key,
+            filename=st.session_state.lambda_filename,
+            session_id=lambda_session_id,
+            question=user_prompt,
+            mode="qa",
+        )
 
-                    if result_data and result_data.get("done"):
-                        answer = result_data.get("result", "")
-                        status_box.update(label="✅ Analysis complete", state="complete", expanded=False)
-                        cleanup_result(lambda_session_id)
-                    else:
-                        answer = "⚠️ Analysis timed out. Please try again."
-                        status_box.update(label="⏰ Timed out", state="error", expanded=False)
+        if not ok:
+            st.warning("⚠️ Cloud dispatch failed — falling back to local pipeline...")
+            _use_lambda = False
+        else:
+            _use_lambda = True
 
-        if _use_lambda:
+            # Stream display: poll S3 every 500ms and yield new chars as they arrive
+            def _lambda_stream():
+                last_len = 0
+                start    = _time.time()
+                while _time.time() - start < 600:
+                    _time.sleep(0.5)
+                    # Check done first
+                    result = poll_result(lambda_session_id)
+                    if result and result.get("done"):
+                        final = result.get("result", "")
+                        if len(final) > last_len:
+                            yield final[last_len:]
+                        return
+                    # Poll stream for incremental tokens
+                    stream_text = poll_stream(lambda_session_id)
+                    if stream_text and len(stream_text) > last_len:
+                        yield stream_text[last_len:]
+                        last_len = len(stream_text)
+                yield "\n\n⚠️ Response timed out."
+
+            with st.chat_message("assistant"):
+                answer = st.write_stream(_lambda_stream())
+
+            answer = answer or ""
+            cleanup_result(lambda_session_id)
             st.session_state.chat.append(("agent", answer))
             if answer:
                 save_to_memory(session_id, user_prompt, answer)
             st.rerun()
-        # if _use_lambda is False, fall through to local pipeline
 
     if not st.session_state.lambda_s3_key:
         token_queue = queue.Queue()
