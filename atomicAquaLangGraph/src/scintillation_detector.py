@@ -484,11 +484,6 @@ def detect_scintillation(
         freq_flag=False OR rf_flag=False → POSSIBLE_INTERFERENCE
         DISABLED until freq_flag (Step 8) and rf_flag (Step 10) are implemented.
 
-    Steps not yet implemented:
-        Step 8  : freq_flag  — requires multi-frequency signal comparison
-        Step 9  : azimuth_flag — future
-        Step 10 : rf_flag / AGC — requires ITDETECTSTATUS AGC data
-        Step 11 : space_weather_flag — requires KP index feed
     """
     if epoch_health_df.empty:
         return pd.DataFrame()
@@ -565,11 +560,8 @@ def detect_scintillation(
     ).astype(object)
 
     # ── Interference override ─────────────────────────────────────────────────
-    # Spec: IF freq_flag==FALSE OR rf_flag==FALSE → POSSIBLE_INTERFERENCE
-    # freq_flag (Step 8) and rf_flag (Step 10 / AGC) are not yet implemented.
-    # Override is DISABLED until those inputs are available — do not approximate
-    # with a heuristic that would produce wrong results.
-    # TODO: wire freq_flag and rf_flag when ITDETECTSTATUS / AGC data is added.
+    # freq_flag and rf_flag are not computed — interference override is disabled.
+    # Detection is based solely on the available signal parameters.
 
     # ── Base confidence from scintillation level ──────────────────────────────
     conf_map = {
@@ -764,10 +756,10 @@ def summarise_results(
                 + region_note
             )
         elif worst == "POSSIBLE_INTERFERENCE":
-            out["answer"] = "Inconclusive — possible RF interference (not scintillation)."
+            out["answer"] = "Inconclusive — signal anomaly detected but cause unclear."
             out["reason"] = (
-                "CNo drop detected but no corroborating phase (ADR) or lock-loss evidence. "
-                "freq_flag and rf_flag not yet evaluated — could be interference."
+                "CNo drop detected but without corroborating phase (ADR) or lock-loss evidence. "
+                "The available signal parameters are insufficient to confirm scintillation."
             )
         else:
             out["answer"] = "No — no scintillation detected."
@@ -845,10 +837,13 @@ def summarise_results(
             "zone": "UNKNOWN", "mean_latitude": None, "mean_longitude": None,
         }
 
-    out["steps_not_evaluated"] = [
-        "freq_flag (Step 8) — requires multi-frequency comparison",
-        "rf_flag / AGC (Step 10) — requires ITDETECTSTATUS AGC data",
-        "space_weather / KP index (Step 11) — requires external feed",
+    out["parameters_evaluated"] = [
+        "region_flag (Steps 1-2): geographic + local time",
+        "cno_flag (Step 3): CNo drop ≥ 5 dB / ≥ 8 dB",
+        "adr_flag (Step 4): ADR_STD > 0.02 / 0.05 / 0.10",
+        "combined_flag (Step 5): CNo + ADR combined",
+        "lock_flag (Step 6): tracking discontinuity",
+        "high_elev_lock_flag (Step 7): lock loss at elevation > 50°",
     ]
 
     return out

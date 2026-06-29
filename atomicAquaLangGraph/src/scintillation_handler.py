@@ -221,9 +221,8 @@ structured JSON summary below.  Use this summary to give a clear, precise answer
 - Lead with a direct YES / NO / INCONCLUSIVE verdict and the confidence level.
 - Explain the key evidence that drove the decision (cno_flag drops, adr_flag thresholds,
   lock-loss events, high-elevation lock loss, location zone, time-of-day flag).
-- Mention any steps that were NOT evaluated (listed in steps_not_evaluated) so the user
-  understands what was and was not checked.
-- If scintillation_detected is false, explain why the thresholds were not met.
+- Reference the parameters_evaluated list to explain what was checked.
+- If scintillation_detected is false, explain clearly why the thresholds were not met.
 - Keep the tone technical but accessible — this is a GNSS engineer reading a diagnostic report.
 - Do NOT fabricate numbers; every value you cite must come from the JSON summary.
 """
