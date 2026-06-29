@@ -1000,5 +1000,5 @@ if (
         streamed_text = streamed_text or ""
         st.session_state.chat.append(("agent", streamed_text))
         if streamed_text:
-        save_to_memory(session_id, user_prompt, streamed_text)
-    st.rerun()
+            save_to_memory(session_id, user_prompt, streamed_text)
+        st.rerun()
