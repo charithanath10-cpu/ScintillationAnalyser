@@ -303,6 +303,10 @@ def _handle_qa(session_id: str, s3_key: str, filename: str, question: str):
         conn = sqlite3.connect(db_path)
 
         main_df = pd.read_sql("SELECT * FROM main_log", conn)
+        # Cast numeric columns that SQLite may read back as int64
+        for col in ["week", "seconds", "idle_pct", "seq"]:
+            if col in main_df.columns:
+                main_df[col] = pd.to_numeric(main_df[col], errors="coerce")
 
         # Load event index and summary from meta table
         meta_row = conn.execute("SELECT summary, events_json FROM meta").fetchone()
@@ -365,10 +369,21 @@ def _handle_scintillation(session_id: str, s3_key: str,
         db_path = _download_db(session_id)
         conn = sqlite3.connect(db_path)
         print("[SCINT] Loading from SQLite")
-        range_df   = pd.read_sql("SELECT * FROM rangea",  conn)
-        bestpos_df = pd.read_sql("SELECT * FROM bestpos", conn)
-        satvis2_df = pd.read_sql("SELECT * FROM satvis2", conn)
+        range_df   = pd.read_sql(
+            "SELECT gps_week, gps_seconds, prn, constellation, signal, adr_std, cn0, locktime FROM rangea",
+            conn)
+        bestpos_df = pd.read_sql(
+            "SELECT gps_week, gps_seconds, latitude, longitude, sol_status, pos_type, diff_age, num_svs FROM bestpos",
+            conn)
+        satvis2_df = pd.read_sql(
+            "SELECT gps_week, gps_seconds, constellation, prn, elevation, azimuth FROM satvis2",
+            conn)
         conn.close()
+        # SQLite may read integer-looking floats as int64 — cast to float for merge_asof
+        for df in [range_df, bestpos_df, satvis2_df]:
+            for col in ["gps_week", "gps_seconds", "prn"]:
+                if col in df.columns:
+                    df[col] = df[col].astype(float)
     else:
         # Fallback: parse raw file for scint logs only
         print("[SCINT] DB not found, parsing raw file")
