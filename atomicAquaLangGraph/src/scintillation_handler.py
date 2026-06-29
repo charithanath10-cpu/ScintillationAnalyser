@@ -101,13 +101,15 @@ def analyse_bytes(
 
         # ── 1. Parse all log types from bytes ─────────────────────────
         text = file_bytes.decode("utf-8", errors="replace")
+        del file_bytes  # free raw bytes immediately after decode
         lines = text.splitlines()
+        del text  # free decoded string — lines list has what we need
 
-        range_obs    = []
-        itdetect_obs = []
+        range_obs     = []
+        itdetect_obs  = []
         trackstat_obs = []
-        bestpos_obs  = []
-        satvis2_obs  = []
+        bestpos_obs   = []
+        satvis2_obs   = []
 
         # re-use the line-level parsers from scintillation_log_decoders
         from src.scintillation_log_decoders import (
@@ -146,12 +148,13 @@ def analyse_bytes(
 
         # Abbreviated TRACKSTAT blocks
         trackstat_obs.extend(_parse_abbrev_trackstat_blocks(lines))
+        del lines  # free line list before building DataFrames
 
-        range_df     = pd.DataFrame(range_obs)     if range_obs     else pd.DataFrame()
-        itdetect_df  = pd.DataFrame(itdetect_obs)  if itdetect_obs  else pd.DataFrame()
-        trackstat_df = pd.DataFrame(trackstat_obs) if trackstat_obs else pd.DataFrame()
-        bestpos_df   = pd.DataFrame(bestpos_obs)   if bestpos_obs   else pd.DataFrame()
-        satvis2_df   = pd.DataFrame(satvis2_obs)   if satvis2_obs   else pd.DataFrame()
+        range_df     = pd.DataFrame(range_obs);     del range_obs
+        itdetect_df  = pd.DataFrame(itdetect_obs);  del itdetect_obs
+        trackstat_df = pd.DataFrame(trackstat_obs); del trackstat_obs
+        bestpos_df   = pd.DataFrame(bestpos_obs);   del bestpos_obs
+        satvis2_df   = pd.DataFrame(satvis2_obs);   del satvis2_obs
 
         # ── 2. Enrich RANGE ───────────────────────────────────────────
         range_df = enrich_range(range_df)
