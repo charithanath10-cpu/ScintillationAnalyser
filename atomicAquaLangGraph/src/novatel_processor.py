@@ -106,7 +106,8 @@ def handler(event, context):
         print(f"[LAMBDA] Ingested {info['records']} records in {time.time()-t1:.2f}s")
 
         if not question:
-            # Pure file ingest — return summary
+            # Pure file ingest — return summary + log types so Streamlit
+            # knows what to store in session state for future routing
             _write_status(session_id, "✅ File parsed successfully", 100)
             _write_result(session_id, {
                 "done": True,
@@ -116,15 +117,49 @@ def handler(event, context):
                     f"{info['log_types']} log types. Ask me anything about this file."
                 ),
                 "summary": info["summary"],
+                "log_types": info["log_types"],
+                "records": info["records"],
                 "session_id": session_id,
             })
             return {"statusCode": 200, "body": "ingest complete"}
 
-        # ── Step 4: Run Q&A pipeline ──────────────────────────────────
-        _write_status(session_id, "🧠 Running analysis pipeline...", 60)
-        t2 = time.time()
-        answer = run_correlation_pipeline(question, session_id)
-        print(f"[LAMBDA] Pipeline complete in {time.time()-t2:.2f}s")
+        # ── Step 4: Run Q&A or scintillation pipeline ─────────────────
+        # Check if this is a scintillation question
+        from src.scintillation_handler import (
+            is_scintillation_question,
+            analyse_bytes as scint_analyse_bytes,
+            build_llm_prompt as scint_build_prompt,
+        )
+
+        if is_scintillation_question(question):
+            _write_status(session_id, "🔬 Running scintillation pipeline...", 50)
+            # Re-fetch file bytes for scintillation (they were deleted above)
+            import io as _io
+            obj2 = _s3.get_object(Bucket=S3_BUCKET, Key=s3_key)
+            buf2 = _io.BytesIO()
+            for chunk in obj2["Body"].iter_chunks(chunk_size=8 * 1024 * 1024):
+                buf2.write(chunk)
+            scint_bytes = buf2.getvalue()
+            del buf2
+
+            _write_status(session_id, "🔬 Analysing signal patterns...", 60)
+            summary = scint_analyse_bytes(scint_bytes, environment_type="OPEN_SKY")
+            del scint_bytes
+
+            if summary.get("pipeline_error"):
+                answer = f"⚠️ Scintillation pipeline error: {summary['pipeline_error']}"
+            else:
+                _write_status(session_id, "🧠 Generating scintillation report...", 80)
+                from src.main import get_llm
+                from langchain_core.messages import HumanMessage
+                prompt = scint_build_prompt(summary, question)
+                resp = get_llm().invoke([HumanMessage(content=prompt)])
+                answer = resp.content.strip()
+        else:
+            _write_status(session_id, "🧠 Running analysis pipeline...", 60)
+            t2 = time.time()
+            answer = run_correlation_pipeline(question, session_id)
+            print(f"[LAMBDA] Pipeline complete in {time.time()-t2:.2f}s")
 
         _write_result(session_id, {
             "done": True,

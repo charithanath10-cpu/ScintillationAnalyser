@@ -74,9 +74,13 @@ if "chat"                      not in st.session_state: st.session_state.chat   
 if "pending_chip"              not in st.session_state: st.session_state.pending_chip              = None
 if "client_id"                 not in st.session_state: st.session_state.client_id                 = str(uuid.uuid4())
 if "pending_upload"            not in st.session_state: st.session_state.pending_upload            = None
+# Lambda session tracking — when file was processed by Lambda, store s3_key
+# so follow-up questions are also routed to Lambda (file not in Streamlit RAM)
+if "lambda_s3_key"             not in st.session_state: st.session_state.lambda_s3_key             = None
+if "lambda_filename"           not in st.session_state: st.session_state.lambda_filename           = None
 # Scintillation flow state
-if "pending_scintillation"     not in st.session_state: st.session_state.pending_scintillation     = None   # question text awaiting env choice
-if "pending_scint_run"         not in st.session_state: st.session_state.pending_scint_run         = None   # question text ready to run
+if "pending_scintillation"     not in st.session_state: st.session_state.pending_scintillation     = None
+if "pending_scint_run"         not in st.session_state: st.session_state.pending_scint_run         = None
 
 st.markdown(
     '<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=DM+Sans:wght@300;400;500;600&display=swap" rel="stylesheet"/>',
@@ -535,6 +539,9 @@ if uploaded_file and uploaded_file.file_id not in st.session_state.get("processe
         """
         st.session_state.chat.append(("file", file_chip_html))
         st.session_state.session_id = "session-" + uuid.uuid4().hex[:10]
+        # Clear lambda routing on new upload
+        st.session_state.lambda_s3_key   = None
+        st.session_state.lambda_filename = None
         print(f"[UPLOAD][3] New session_id={st.session_state.session_id}")
 
         if file_size > SIZE_THRESHOLD:
@@ -654,6 +661,9 @@ if st.session_state.pending_upload:
                     print(f"[PROCESS][4] Lambda result received in {elapsed}s")
                     status_box.update(label=f"✅ {file_name} processed", state="complete", expanded=False)
                     cleanup_result(file_session_id)
+                    # Store s3_key so follow-up questions are routed to Lambda too
+                    st.session_state.lambda_s3_key   = upload_info.get("s3_key")
+                    st.session_state.lambda_filename = file_name
                 else:
                     result_text = "⚠️ Processing timed out after 10 minutes. Try a smaller file or ask a question directly."
                     status_box.update(label="⏰ Processing timed out", state="error", expanded=False)
@@ -762,10 +772,52 @@ if st.session_state.pending_scint_run:
     st.session_state.pending_scint_run = None
     session_id = st.session_state.session_id
 
-    import threading
-    import time
-    import queue
+    import threading, time, queue
 
+    # ── Lambda routing for scintillation ─────────────────────────────
+    if st.session_state.lambda_s3_key:
+        from src.lambda_client import invoke_processor_async, poll_result, poll_status, cleanup_result
+        scint_lambda_sid = session_id + "-scint"
+        with st.chat_message("assistant", avatar="🛰"):
+            with st.status("🔬 Running scintillation analysis in cloud...", expanded=True) as scint_status_box:
+                st.write("🚀 Dispatching to cloud processor...")
+                ok = invoke_processor_async(
+                    s3_key=st.session_state.lambda_s3_key,
+                    filename=st.session_state.lambda_filename,
+                    session_id=scint_lambda_sid,
+                    question=scint_question,
+                )
+                if ok:
+                    elapsed, last_msg = 0, ""
+                    result_data = None
+                    while elapsed < 600:
+                        time.sleep(3); elapsed += 3
+                        result_data = poll_result(scint_lambda_sid)
+                        if result_data and result_data.get("done"):
+                            break
+                        sd = poll_status(scint_lambda_sid)
+                        if sd:
+                            msg = sd.get("status", "")
+                            if msg and msg != last_msg:
+                                st.write(f"{msg} ({elapsed}s)"); last_msg = msg
+                        elif elapsed % 9 == 0:
+                            st.write(f"⏳ Still processing... ({elapsed}s)")
+                    if result_data and result_data.get("done"):
+                        scint_text = result_data.get("result", "")
+                        scint_status_box.update(label="✅ Scintillation analysis complete", state="complete", expanded=False)
+                        cleanup_result(scint_lambda_sid)
+                    else:
+                        scint_text = "⚠️ Scintillation analysis timed out."
+                        scint_status_box.update(label="⏰ Timed out", state="error", expanded=False)
+                else:
+                    scint_text = "⚠️ Failed to dispatch to cloud processor."
+                    scint_status_box.update(label="❌ Failed", state="error", expanded=False)
+        st.session_state.chat.append(("agent", scint_text or ""))
+        if scint_text:
+            save_to_memory(session_id, scint_question, scint_text)
+        st.rerun()
+
+    # ── Local scintillation pipeline (small files) ────────────────────
     scint_queue = queue.Queue()
 
     def _scint_background():
@@ -779,13 +831,11 @@ if st.session_state.pending_scint_run:
 
     threading.Thread(target=_scint_background, daemon=True).start()
 
-    # Status banner while pipeline runs
     scint_status_ph = st.empty()
     with scint_status_ph.container():
         with st.chat_message("assistant", avatar="🛰"):
             st.markdown("*🔬 Running scintillation pipeline…*")
 
-    # Wait for first token
     first_tok = False
     while not first_tok:
         try:
@@ -804,17 +854,13 @@ if st.session_state.pending_scint_run:
     def _scint_tokens():
         while True:
             try:
-                typ, dat = scint_queue.get(timeout=1000)  # 5 min — scintillation pipeline can be slow
-                if typ == "token":
-                    yield dat
-                elif typ == "done":
-                    break
+                typ, dat = scint_queue.get(timeout=300)
+                if typ == "token": yield dat
+                elif typ == "done": break
                 elif typ == "error":
-                    yield f"\n\nError: {dat}"
-                    break
+                    yield f"\n\nError: {dat}"; break
             except queue.Empty:
-                yield "\n\n⚠️ Analysis timed out. The file may be too large or the service is busy. Please try again."
-                break
+                yield "\n\n⚠️ Analysis timed out. Please try again."; break
 
     with st.chat_message("assistant"):
         scint_text = st.write_stream(_scint_tokens())
@@ -834,91 +880,125 @@ if (
     and st.session_state.chat[-1][0] == "user"
     and not _scint_waiting
 ):
-    # Capture values from session state
     user_prompt = st.session_state.chat[-1][1]
-    session_id = st.session_state.session_id
+    session_id  = st.session_state.session_id
 
-    import threading
-    import time
-    import queue
+    import threading, time, queue
 
-    # Strategy:
-    # 1. Run streaming pipeline in background thread (tools execute, then LLM streams)
-    # 2. While waiting for first token, show live status updates
-    # 3. Once first token arrives, switch to st.write_stream for live rendering
+    # ── Lambda routing: file was processed by Lambda → send question there too ──
+    # The parsed DataFrame lives in Lambda's memory, not here.
+    # Re-ingest + answer in one Lambda call.
+    if st.session_state.lambda_s3_key:
+        from src.lambda_client import invoke_processor_async, poll_result, poll_status, cleanup_result
+        lambda_session_id = session_id + "-q"   # unique key per question
 
-    token_queue = queue.Queue()
-
-    # Capture chat history on main thread (threads can't access st.session_state)
-    chat_hist = [(role, text) for role, text in st.session_state.chat
-                 if role in ("user", "agent")]
-
-    def background_stream():
-        """Run the streaming pipeline, push chunks to queue."""
-        try:
-            for chunk in run_correlation_pipeline_streaming(user_prompt, session_id, chat_history=chat_hist):
-                token_queue.put(("token", chunk))
-        except Exception as e:
-            token_queue.put(("error", str(e)))
-        finally:
-            token_queue.put(("done", None))
-
-    # Start pipeline in background
-    stream_thread = threading.Thread(target=background_stream, daemon=True)
-    stream_thread.start()
-
-    # Show live status updates until first token arrives
-    status_placeholder = st.empty()
-    last_status = "Analyzing your question..."
-
-    with status_placeholder.container():
         with st.chat_message("assistant", avatar="🛰"):
-            st.markdown(f"*{last_status}*")
+            with st.status("🧠 Analysing in cloud engine...", expanded=True) as status_box:
+                st.write("🚀 Sending question to cloud processor...")
+                ok = invoke_processor_async(
+                    s3_key=st.session_state.lambda_s3_key,
+                    filename=st.session_state.lambda_filename,
+                    session_id=lambda_session_id,
+                    question=user_prompt,
+                )
+                if not ok:
+                    st.write("⚠️ Cloud dispatch failed — falling back to local pipeline...")
+                    # fall through to local pipeline below by clearing lambda_s3_key temporarily
+                    _use_lambda = False
+                else:
+                    _use_lambda = True
+                    elapsed, last_msg = 0, ""
+                    result_data = None
+                    while elapsed < 600:
+                        time.sleep(3); elapsed += 3
+                        result_data = poll_result(lambda_session_id)
+                        if result_data and result_data.get("done"):
+                            break
+                        sd = poll_status(lambda_session_id)
+                        if sd:
+                            msg = sd.get("status", "")
+                            if msg and msg != last_msg:
+                                st.write(f"{msg} ({elapsed}s)"); last_msg = msg
+                        elif elapsed % 9 == 0:
+                            st.write(f"⏳ Still processing... ({elapsed}s)")
 
-    first_token_received = False
-    while not first_token_received:
-        # Check for first token (non-blocking, 200ms timeout)
-        try:
-            msg_type, msg_data = token_queue.get(timeout=0.2)
-            token_queue.put((msg_type, msg_data))  # Put back for stream loop
-            first_token_received = True
-            break
-        except queue.Empty:
-            pass
+                    if result_data and result_data.get("done"):
+                        answer = result_data.get("result", "")
+                        status_box.update(label="✅ Analysis complete", state="complete", expanded=False)
+                        cleanup_result(lambda_session_id)
+                    else:
+                        answer = "⚠️ Analysis timed out. Please try again."
+                        status_box.update(label="⏰ Timed out", state="error", expanded=False)
 
-        # Update status from pipeline
-        current_status = agent_get_status(session_id)
-        if current_status and current_status != last_status and current_status != "Complete ✓":
-            last_status = current_status
-            with status_placeholder.container():
-                with st.chat_message("assistant", avatar="🛰"):
-                    st.markdown(f"*{current_status}*")
+        if _use_lambda:
+            st.session_state.chat.append(("agent", answer))
+            if answer:
+                save_to_memory(session_id, user_prompt, answer)
+            st.rerun()
+        # if _use_lambda is False, fall through to local pipeline
 
-    # Clear status — switch to streaming output
-    status_placeholder.empty()
+    if not st.session_state.lambda_s3_key:
+        token_queue = queue.Queue()
 
-    # Stream tokens into chat bubble
-    def token_generator():
-        while True:
+        chat_hist = [(role, text) for role, text in st.session_state.chat
+                     if role in ("user", "agent")]
+
+        def background_stream():
             try:
-                msg_type, msg_data = token_queue.get(timeout=300)  # 5 min — LLM + tool execution can be slow
-                if msg_type == "token":
-                    yield msg_data
-                elif msg_type == "done":
-                    break
-                elif msg_type == "error":
-                    yield f"\n\nError: {msg_data}"
-                    break
-            except queue.Empty:
-                yield "\n\n⚠️ Response timed out. The service may be busy — please try again."
+                for chunk in run_correlation_pipeline_streaming(user_prompt, session_id, chat_history=chat_hist):
+                    token_queue.put(("token", chunk))
+            except Exception as e:
+                token_queue.put(("error", str(e)))
+            finally:
+                token_queue.put(("done", None))
+
+        stream_thread = threading.Thread(target=background_stream, daemon=True)
+        stream_thread.start()
+
+        status_placeholder = st.empty()
+        last_status = "Analyzing your question..."
+        with status_placeholder.container():
+            with st.chat_message("assistant", avatar="🛰"):
+                st.markdown(f"*{last_status}*")
+
+        first_token_received = False
+        while not first_token_received:
+            try:
+                msg_type, msg_data = token_queue.get(timeout=0.2)
+                token_queue.put((msg_type, msg_data))
+                first_token_received = True
                 break
+            except queue.Empty:
+                pass
+            current_status = agent_get_status(session_id)
+            if current_status and current_status != last_status and current_status != "Complete ✓":
+                last_status = current_status
+                with status_placeholder.container():
+                    with st.chat_message("assistant", avatar="🛰"):
+                        st.markdown(f"*{current_status}*")
 
-    with st.chat_message("assistant"):
-        streamed_text = st.write_stream(token_generator())
+        status_placeholder.empty()
 
-    # Save full response to chat history and memory
-    streamed_text = streamed_text or ""
-    st.session_state.chat.append(("agent", streamed_text))
-    if streamed_text:
+        def token_generator():
+            while True:
+                try:
+                    msg_type, msg_data = token_queue.get(timeout=300)
+                    if msg_type == "token":
+                        yield msg_data
+                    elif msg_type == "done":
+                        break
+                    elif msg_type == "error":
+                        yield f"\n\nError: {msg_data}"
+                        break
+                except queue.Empty:
+                    yield "\n\n⚠️ Response timed out. The service may be busy — please try again."
+                    break
+
+        with st.chat_message("assistant"):
+            streamed_text = st.write_stream(token_generator())
+
+        streamed_text = streamed_text or ""
+        st.session_state.chat.append(("agent", streamed_text))
+        if streamed_text:
         save_to_memory(session_id, user_prompt, streamed_text)
     st.rerun()
